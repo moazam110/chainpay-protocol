@@ -15,9 +15,8 @@ import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
  * @title  CryptoPaymentPlatform
  * @notice Combined pool-vault ledger with invoice payment escrow and dispute
  *         resolution, designed for deployment on Arbitrum.
- * @dev    v1.1.0 — adds per-token flat-fee support, ACTIVE recurring status,
- *         token decimals registry, open-invoice limits, batch admin operations,
- *         and escrow-aware emergency withdrawal.
+ * @dev    v1.3.0 — removes open-invoice cap, batch-cancel, and withdrawAllTokens;
+ *         streamlined to core payment and escrow functionality only.
  *
  * Architecture overview
  * ─────────────────────
@@ -49,7 +48,7 @@ contract CryptoPaymentPlatform is Ownable, ReentrancyGuard, Pausable {
     // =========================================================================
 
     /// @notice Contract version — increment on each deployment.
-    string public constant VERSION = "1.2.0";
+    string public constant VERSION = "1.3.0";
 
     /// @notice Sentinel used in the internal ledger to represent native ETH.
     address public constant NATIVE_ETH = address(0);
@@ -191,16 +190,6 @@ contract CryptoPaymentPlatform is Ownable, ReentrancyGuard, Pausable {
     /// @dev Index: payer → list of invoice IDs assigned to them.
     mapping(address => uint256[]) private _payerInvoices;
 
-    /**
-     * @notice Maximum number of non-terminal invoices a merchant may hold open
-     *         simultaneously (PENDING + ACTIVE + PAID + DISPUTED).
-     *         0 means unlimited.
-     */
-    uint256 public maxOpenInvoicesPerMerchant;
-
-    /// @dev Tracks open (non-terminal) invoice count per merchant.
-    mapping(address => uint256) private _openInvoiceCount;
-
     // =========================================================================
     //  STATE — Escrow
     // =========================================================================
@@ -284,9 +273,6 @@ contract CryptoPaymentPlatform is Ownable, ReentrancyGuard, Pausable {
     /// @notice Emitted when admin removes a token from the whitelist.
     event TokenRemoved(address indexed token);
 
-    /// @notice Emitted when admin changes the open-invoice cap for merchants.
-    event MaxOpenInvoicesUpdated(uint256 newLimit);
-
     event InvoiceCreated(
         uint256 indexed invoiceId,
         address indexed merchant,
@@ -354,7 +340,6 @@ contract CryptoPaymentPlatform is Ownable, ReentrancyGuard, Pausable {
     error TransactionExpired();
     error ZeroAddress();
     error ContractMustBePaused();
-    error MaxOpenInvoicesReached(address merchant, uint256 limit);
 
     // =========================================================================
     //  MODIFIERS
@@ -436,7 +421,7 @@ contract CryptoPaymentPlatform is Ownable, ReentrancyGuard, Pausable {
      * @notice Deposit native ETH into the pool vault.
      * @dev    The ETH is held by the contract; only the caller's internal ledger
      *         balance is updated. No ETH leaves the contract until the user
-     *         explicitly calls `withdrawETH` or `withdrawAllTokens`.
+     *         explicitly calls `withdrawETH`.
      */
     function depositETH()
         external
@@ -529,45 +514,6 @@ contract CryptoPaymentPlatform is Ownable, ReentrancyGuard, Pausable {
         IERC20(token).safeTransfer(msg.sender, amount);
 
         emit Withdrawal(msg.sender, token, amount);
-    }
-
-    /**
-     * @notice Convenience function: sweep all non-zero ledger balances for the
-     *         given token list to the caller's wallet in a single transaction.
-     * @dev    Caller must supply the list of token addresses to iterate. Tokens
-     *         with zero balance are silently skipped. No revert on partial failure.
-     *
-     * @param tokens Array of token addresses (include address(0) for ETH).
-     */
-    function withdrawAllTokens(address[] calldata tokens)
-        external
-        nonReentrant
-        whenNotPaused
-    {
-        for (uint256 i = 0; i < tokens.length; ) {
-            address token = tokens[i];
-            uint256 bal   = _ledger[msg.sender][token];
-
-            if (bal > 0) {
-                _ledger[msg.sender][token] = 0;
-
-                if (token == NATIVE_ETH) {
-                    (bool ok, ) = msg.sender.call{value: bal}("");
-                    if (!ok) {
-                        // Restore balance on failure so the user can retry or
-                        // use withdrawETH() directly. Continuing the loop means
-                        // subsequent ERC-20 tokens are still swept successfully.
-                        _ledger[msg.sender][token] = bal;
-                    } else {
-                        emit Withdrawal(msg.sender, token, bal);
-                    }
-                } else {
-                    IERC20(token).safeTransfer(msg.sender, bal);
-                    emit Withdrawal(msg.sender, token, bal);
-                }
-            }
-            unchecked { i++; }
-        }
     }
 
     // =========================================================================
@@ -706,13 +652,6 @@ contract CryptoPaymentPlatform is Ownable, ReentrancyGuard, Pausable {
             revert InvalidAmount();
         }
 
-        // Enforce open-invoice cap if configured
-        if (maxOpenInvoicesPerMerchant > 0 &&
-            _openInvoiceCount[msg.sender] >= maxOpenInvoicesPerMerchant)
-        {
-            revert MaxOpenInvoicesReached(msg.sender, maxOpenInvoicesPerMerchant);
-        }
-
         unchecked { _invoiceCounter++; }
         invoiceId = _invoiceCounter;
 
@@ -736,7 +675,6 @@ contract CryptoPaymentPlatform is Ownable, ReentrancyGuard, Pausable {
 
         _merchantInvoices[msg.sender].push(invoiceId);
         _payerInvoices[payer].push(invoiceId);
-        _openInvoiceCount[msg.sender]++;
 
         emit InvoiceCreated(
             invoiceId, msg.sender, payer, amount, token, paymentType, isRecurring
@@ -774,7 +712,6 @@ contract CryptoPaymentPlatform is Ownable, ReentrancyGuard, Pausable {
         }
 
         inv.status = InvoiceStatus.CANCELLED;
-        _closeInvoice(inv.merchant);
         emit InvoiceCancelled(invoiceId, reason);
     }
 
@@ -795,7 +732,6 @@ contract CryptoPaymentPlatform is Ownable, ReentrancyGuard, Pausable {
         }
 
         inv.status = InvoiceStatus.CANCELLED;
-        _closeInvoice(inv.merchant);
         emit InvoiceCancelled(invoiceId, reason);
     }
 
@@ -879,7 +815,6 @@ contract CryptoPaymentPlatform is Ownable, ReentrancyGuard, Pausable {
         _releaseEscrowToMerchant(invoiceId, inv.merchant, inv.payer, esc);
 
         inv.status = InvoiceStatus.COMPLETED;
-        _closeInvoice(inv.merchant);
         emit InvoiceMarkedComplete(invoiceId, msg.sender);
     }
 
@@ -925,7 +860,6 @@ contract CryptoPaymentPlatform is Ownable, ReentrancyGuard, Pausable {
         _ledger[owner()][token]      += fee;
 
         inv.status = InvoiceStatus.COMPLETED;
-        _closeInvoice(inv.merchant);
         nonces[msg.sender]++;
 
         // --- Events ---
@@ -1051,7 +985,6 @@ contract CryptoPaymentPlatform is Ownable, ReentrancyGuard, Pausable {
 
         if (inv.completedCycles >= inv.maxCycles) {
             inv.status = InvoiceStatus.COMPLETED;
-            _closeInvoice(inv.merchant);
             emit InvoiceMarkedComplete(invoiceId, inv.merchant);
         } else {
             // Mark ACTIVE so the merchant cannot self-cancel mid-stream
@@ -1136,7 +1069,6 @@ contract CryptoPaymentPlatform is Ownable, ReentrancyGuard, Pausable {
         }
 
         inv.status = InvoiceStatus.COMPLETED;
-        _closeInvoice(inv.merchant);
     }
 
     /**
@@ -1165,7 +1097,6 @@ contract CryptoPaymentPlatform is Ownable, ReentrancyGuard, Pausable {
         esc.frozen = false;
         _releaseEscrowToMerchant(invoiceId, inv.merchant, inv.payer, esc);
         inv.status = InvoiceStatus.COMPLETED;
-        _closeInvoice(inv.merchant);
         emit InvoiceMarkedComplete(invoiceId, inv.merchant);
     }
 
@@ -1195,11 +1126,10 @@ contract CryptoPaymentPlatform is Ownable, ReentrancyGuard, Pausable {
         esc.frozen = false;
         _refundEscrowToPayer(invoiceId, inv.payer, esc);
         inv.status = InvoiceStatus.COMPLETED;
-        _closeInvoice(inv.merchant);
     }
 
     // =========================================================================
-    //  SECTION 10 — INTERNAL ESCROW & OPEN-COUNT HELPERS
+    //  SECTION 10 — INTERNAL ESCROW HELPERS
     // =========================================================================
 
     /**
@@ -1245,16 +1175,6 @@ contract CryptoPaymentPlatform is Ownable, ReentrancyGuard, Pausable {
         _ledger[payer][token] += amount;
 
         emit FundsRefunded(invoiceId, payer, amount);
-    }
-
-    /**
-     * @dev Decrements the merchant's open-invoice count when an invoice reaches
-     *      a terminal state (COMPLETED or CANCELLED). Protected against underflow.
-     */
-    function _closeInvoice(address merchant) internal {
-        if (_openInvoiceCount[merchant] > 0) {
-            unchecked { _openInvoiceCount[merchant]--; }
-        }
     }
 
     // =========================================================================
@@ -1510,62 +1430,6 @@ contract CryptoPaymentPlatform is Ownable, ReentrancyGuard, Pausable {
     }
 
     /**
-     * @notice Admin sets the maximum number of non-terminal invoices a merchant
-     *         may hold simultaneously.
-     *
-     * @param limit New cap (0 = unlimited).
-     */
-    function setMaxOpenInvoices(uint256 limit) external onlyAdmin {
-        maxOpenInvoicesPerMerchant = limit;
-        emit MaxOpenInvoicesUpdated(limit);
-    }
-
-    /**
-     * @notice Admin or employee cancels multiple invoices in a single transaction.
-     *
-     * @dev    Only PENDING and ACTIVE invoices are cancelled; others are silently
-     *         skipped to prevent revert-bombing the whole batch. Non-existent IDs
-     *         are also silently skipped.
-     *
-     * @param invoiceIds Array of invoice IDs to cancel.
-     * @param reason     Cancellation reason applied to all (stored in events).
-     */
-    function batchCancelInvoices(
-        uint256[] calldata invoiceIds,
-        string calldata reason
-    )
-        external
-        onlyAdminOrEmployee
-    {
-        for (uint256 i = 0; i < invoiceIds.length; ) {
-            uint256 id = invoiceIds[i];
-
-            // Skip non-existent invoices gracefully
-            if (_invoices[id].id == 0) {
-                unchecked { i++; }
-                continue;
-            }
-
-            Invoice storage inv = _invoices[id];
-
-            if (
-                inv.status == InvoiceStatus.PENDING ||
-                inv.status == InvoiceStatus.ACTIVE
-            ) {
-                inv.status = InvoiceStatus.CANCELLED;
-                _closeInvoice(inv.merchant);
-                emit InvoiceCancelled(id, reason);
-            }
-            // PAID, DISPUTED, COMPLETED, and CANCELLED invoices are intentionally
-            // skipped. PAID and DISPUTED invoices have real money locked in escrow
-            // that cannot be safely cancelled in a batch — use adminRefundToPayer
-            // or adminReleaseToMerchant individually for each of those.
-
-            unchecked { i++; }
-        }
-    }
-
-    /**
      * @notice Transfers contract ownership to a new admin address.
      * @dev    Overrides `Ownable.transferOwnership` to emit `AdminTransferred`.
      *
@@ -1679,7 +1543,6 @@ contract CryptoPaymentPlatform is Ownable, ReentrancyGuard, Pausable {
 
                 // Terminate the invoice cleanly
                 inv.status = InvoiceStatus.CANCELLED;
-                _closeInvoice(inv.merchant);
                 emit InvoiceCancelled(invoiceId, "Emergency shutdown");
             }
 
@@ -1875,17 +1738,6 @@ contract CryptoPaymentPlatform is Ownable, ReentrancyGuard, Pausable {
      */
     function getUserConfig(address user) external view returns (UserConfig memory) {
         return _userConfig[user];
-    }
-
-    /**
-     * @notice Returns the number of non-terminal invoices currently open for a
-     *         merchant (PENDING + ACTIVE + PAID + DISPUTED).
-     *
-     * @param merchant Merchant address.
-     * @return         Open invoice count.
-     */
-    function getOpenInvoiceCount(address merchant) external view returns (uint256) {
-        return _openInvoiceCount[merchant];
     }
 
     /**
