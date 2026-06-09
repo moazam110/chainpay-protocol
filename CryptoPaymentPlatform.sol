@@ -15,8 +15,21 @@ import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
  * @title  CryptoPaymentPlatform
  * @notice Combined pool-vault ledger with invoice payment escrow and dispute
  *         resolution, designed for deployment on Arbitrum.
- * @dev    v1.3.0 — removes open-invoice cap, batch-cancel, and withdrawAllTokens;
- *         streamlined to core payment and escrow functionality only.
+ * @dev    v1.5.0 — fixes: receive() uses ContractMustBePaused, remove stray NatSpec char,
+ *         removeExternalWallet requires permission, challenge-count cap with
+ *         maxChallengesPerInvoice, payerAcknowledged flag on Invoice with
+ *         acknowledgeInvoice(), calendar-month bucket via _getMonthKey(), P2P transfers
+ *         use _calculateDefaultFee (no tier/override), minimum fee floor of 1,
+ *         adminRefundToPayer accepts CHALLENGE_PENDING, editInvoice guards newMaxCycles,
+ *         SubscriptionConfigUpdated event.
+ * @dev    v1.4.1 — audit fixes: editInvoice access control (admin/employee can edit),
+ *         adminReleaseToMerchant accepts CHALLENGE_PENDING, setChallengeWindow minimum
+ *         1-day guard, FeeDeducted uses type(uint256).max for P2P transfer fees.
+ * @dev    v1.4.0 — adds 8 new features: partial refund (Feature 1), invoice edit
+ *         (Feature 2), dispute challenge window (Feature 3), P2P internal transfer
+ *         (Feature 4), external wallet registration (Feature 5), external withdrawal
+ *         permission (Feature 6), monthly receive limit (Feature 7), and user tier
+ *         classification with tiered fee discounts (Feature 8).
  *
  * Architecture overview
  * ─────────────────────
@@ -48,7 +61,7 @@ contract CryptoPaymentPlatform is Ownable, ReentrancyGuard, Pausable {
     // =========================================================================
 
     /// @notice Contract version — increment on each deployment.
-    string public constant VERSION = "1.3.0";
+    string public constant VERSION = "1.5.0";
 
     /// @notice Sentinel used in the internal ledger to represent native ETH.
     address public constant NATIVE_ETH = address(0);
@@ -63,12 +76,13 @@ contract CryptoPaymentPlatform is Ownable, ReentrancyGuard, Pausable {
 
     /// @notice Full lifecycle of an invoice.
     enum InvoiceStatus {
-        PENDING,   // created, awaiting first payment / first recurring cycle
-        ACTIVE,    // recurring only: ≥1 cycle completed, more remain
-        PAID,      // payer paid prepaid invoice; escrow locked
-        COMPLETED, // merchant confirmed, postpaid settled, or all cycles done
-        CANCELLED, // voided by merchant, payer, admin, or emergency shutdown
-        DISPUTED   // payer raised a dispute; escrow frozen
+        PENDING,           // created, awaiting first payment / first recurring cycle
+        ACTIVE,            // recurring only: ≥1 cycle completed, more remain
+        PAID,              // payer paid prepaid invoice; escrow locked
+        COMPLETED,         // merchant confirmed, postpaid settled, or all cycles done
+        CANCELLED,         // voided by merchant, payer, admin, or emergency shutdown
+        DISPUTED,          // payer raised a dispute; escrow frozen
+        CHALLENGE_PENDING  // dispute ruled merchant-wins; payer challenge window open
     }
 
     /// @notice Determines escrow behaviour and timing of fee deduction.
@@ -82,6 +96,10 @@ contract CryptoPaymentPlatform is Ownable, ReentrancyGuard, Pausable {
         PERCENTAGE, // value stored in basis points (e.g. 250 = 2.5 %)
         FLAT        // per-token flat amounts stored in separate mappings
     }
+
+    /// @notice User loyalty tier that determines the fee discount applied when
+    ///         the user acts as a merchant and has no per-user fee override.
+    enum UserTier { STANDARD, SILVER, GOLD, PLATINUM }
 
     // =========================================================================
     //  STRUCTS
@@ -108,6 +126,7 @@ contract CryptoPaymentPlatform is Ownable, ReentrancyGuard, Pausable {
         uint256       completedCycles;   // cycles successfully triggered so far
         uint256       nextDueDate;       // earliest timestamp for the next cycle
         uint256       createdAt;
+        bool          payerAcknowledged; // false after editInvoice; payer must re-ack before paying
     }
 
     /// @notice Mutable per-user metadata.
@@ -257,6 +276,62 @@ contract CryptoPaymentPlatform is Ownable, ReentrancyGuard, Pausable {
     mapping(address => uint256) public nonces;
 
     // =========================================================================
+    //  STATE — Dispute Challenge Window  (Feature 3)
+    // =========================================================================
+
+    /// @notice Duration (seconds) of the payer challenge window after a
+    ///         merchant-wins dispute ruling. Default: 30 days.
+    uint256 public challengeWindowDuration = 30 days;
+
+    /// @dev Invoice ID → deadline timestamp by which the payer may challenge.
+    mapping(uint256 => uint256) private _disputeChallengeDeadline;
+
+    /// @dev Invoice ID → number of times the payer has challenged a ruling.
+    mapping(uint256 => uint256) private _challengeCount;
+
+    /// @notice Maximum times a payer may challenge a single invoice's ruling.
+    ///         Admin-configurable; default 1.
+    uint256 public maxChallengesPerInvoice = 1;
+
+    // =========================================================================
+    //  STATE — External Wallet Registration  (Feature 5)
+    // =========================================================================
+
+    /// @dev user → registered external wallet address (address(0) = none registered).
+    mapping(address => address) private _externalWallet;
+
+    // =========================================================================
+    //  STATE — External Withdrawal Permission  (Feature 6)
+    // =========================================================================
+
+    /// @dev user → whether admin has granted external-withdrawal permission.
+    ///      Only consulted when the user has a registered external wallet.
+    mapping(address => bool) private _canWithdrawExternal;
+
+    // =========================================================================
+    //  STATE — Monthly Receive Limit  (Feature 7)
+    // =========================================================================
+
+    /// @notice Maximum fee-free family transfers a wallet may receive per 30-day
+    ///         window. Admin-configurable; default 5.
+    uint256 public freeReceiveLimit = 5;
+
+    /// @dev recipient → monthKey → count of family-transfer receives.
+    ///      monthKey = _getMonthKey(block.timestamp) → YYYYMM (calendar month).
+    mapping(address => mapping(uint256 => uint256)) private _monthlyReceiveCount;
+
+    // =========================================================================
+    //  STATE — User Tier Classification  (Feature 8)
+    // =========================================================================
+
+    /// @dev user → loyalty tier (default STANDARD for all wallets).
+    mapping(address => UserTier) private _userTier;
+
+    /// @dev tier → fee discount in basis points applied on the base fee.
+    ///      Defaults: STANDARD=0, SILVER=1000, GOLD=2000, PLATINUM=3000.
+    mapping(UserTier => uint256) private _tierDiscount;
+
+    // =========================================================================
     //  EVENTS
     // =========================================================================
 
@@ -318,6 +393,26 @@ contract CryptoPaymentPlatform is Ownable, ReentrancyGuard, Pausable {
         uint256 amount
     );
 
+    // Feature 2 — Invoice Edit
+    event InvoiceEdited(uint256 indexed invoiceId, address indexed editor, uint256 timestamp);
+
+    // Feature 3 — Dispute Challenge Window
+    event DisputeChallenged(uint256 indexed invoiceId, address indexed challenger, string evidence);
+
+    // Feature 5 — External Wallet Registration
+    event ExternalWalletRegistered(address indexed user, address indexed externalWallet);
+    event ExternalWalletRemoved(address indexed user);
+
+    // Feature 6 — External Withdrawal Permission
+    event ExternalWithdrawPermissionUpdated(address indexed user, bool canWithdraw);
+
+    // Feature 8 — User Tier Classification
+    event UserTierUpdated(address indexed user, UserTier tier);
+
+    // v1.5.0 additions
+    event SubscriptionConfigUpdated(address indexed token, uint256 fee, uint256 duration);
+    event InvoiceAcknowledged(uint256 indexed invoiceId, address indexed payer);
+
     // =========================================================================
     //  CUSTOM ERRORS
     // =========================================================================
@@ -340,6 +435,22 @@ contract CryptoPaymentPlatform is Ownable, ReentrancyGuard, Pausable {
     error TransactionExpired();
     error ZeroAddress();
     error ContractMustBePaused();
+    // Feature 1 — Partial Refund
+    error PartialRefundExceedsEscrow(uint256 invoiceId, uint256 requested, uint256 available);
+    // Feature 2 — Invoice Edit
+    error InvoiceNotEditable(uint256 invoiceId);
+    // Feature 3 — Dispute Challenge Window
+    error ChallengeWindowExpired(uint256 invoiceId, uint256 deadline);
+    error ResolutionNotReady(uint256 invoiceId, uint256 readyAt);
+    // Feature 4 — P2P Internal Transfer
+    error CannotTransferToSelf();
+    // Feature 5 — External Wallet Registration
+    error CannotRegisterOwnAddress();
+    // Feature 6 — External Withdrawal Permission
+    error ExternalWithdrawNotApproved(address user);
+    // v1.5.0 additions
+    error MaxChallengesReached(uint256 invoiceId);
+    error InvoiceNotAcknowledged(uint256 invoiceId);
 
     // =========================================================================
     //  MODIFIERS
@@ -411,6 +522,11 @@ contract CryptoPaymentPlatform is Ownable, ReentrancyGuard, Pausable {
 
         subscriptionToken = _subscriptionToken;
         subscriptionFee   = _subscriptionFee;
+
+        // Feature 8: initialize default tier discounts
+        _tierDiscount[UserTier.SILVER]   = 1_000; // 10% reduction on base fee
+        _tierDiscount[UserTier.GOLD]     = 2_000; // 20% reduction on base fee
+        _tierDiscount[UserTier.PLATINUM] = 3_000; // 30% reduction on base fee
     }
 
     // =========================================================================
@@ -479,6 +595,10 @@ contract CryptoPaymentPlatform is Ownable, ReentrancyGuard, Pausable {
         if (amount == 0) revert InvalidAmount();
         uint256 bal = _ledger[msg.sender][NATIVE_ETH];
         if (bal < amount) revert InsufficientBalance(msg.sender, NATIVE_ETH, amount, bal);
+        // Feature 6: users with a registered external wallet require admin permission to withdraw
+        if (_externalWallet[msg.sender] != address(0) && !_canWithdrawExternal[msg.sender]) {
+            revert ExternalWithdrawNotApproved(msg.sender);
+        }
 
         // Effect before interaction (CEI)
         _ledger[msg.sender][NATIVE_ETH] -= amount;
@@ -508,6 +628,10 @@ contract CryptoPaymentPlatform is Ownable, ReentrancyGuard, Pausable {
         if (amount == 0) revert InvalidAmount();
         uint256 bal = _ledger[msg.sender][token];
         if (bal < amount) revert InsufficientBalance(msg.sender, token, amount, bal);
+        // Feature 6: users with a registered external wallet require admin permission to withdraw
+        if (_externalWallet[msg.sender] != address(0) && !_canWithdrawExternal[msg.sender]) {
+            revert ExternalWithdrawNotApproved(msg.sender);
+        }
 
         // Effect before interaction (CEI)
         _ledger[msg.sender][token] -= amount;
@@ -670,7 +794,8 @@ contract CryptoPaymentPlatform is Ownable, ReentrancyGuard, Pausable {
             maxCycles:         maxCycles,
             completedCycles:   0,
             nextDueDate:       isRecurring ? block.timestamp + recurringInterval : 0,
-            createdAt:         block.timestamp
+            createdAt:         block.timestamp,
+            payerAcknowledged: true
         });
 
         _merchantInvoices[msg.sender].push(invoiceId);
@@ -763,6 +888,7 @@ contract CryptoPaymentPlatform is Ownable, ReentrancyGuard, Pausable {
         if (inv.status != InvoiceStatus.PENDING) {
             revert InvalidInvoiceStatus(invoiceId, inv.status);
         }
+        if (!inv.payerAcknowledged) revert InvoiceNotAcknowledged(invoiceId);
         if (block.timestamp > inv.dueDate) revert InvoiceDueDatePassed(invoiceId);
 
         address token  = inv.token;
@@ -846,6 +972,7 @@ contract CryptoPaymentPlatform is Ownable, ReentrancyGuard, Pausable {
         if (inv.status != InvoiceStatus.PENDING) {
             revert InvalidInvoiceStatus(invoiceId, inv.status);
         }
+        if (!inv.payerAcknowledged) revert InvoiceNotAcknowledged(invoiceId);
 
         address token  = inv.token;
         uint256 amount = inv.amount;
@@ -1058,17 +1185,19 @@ contract CryptoPaymentPlatform is Ownable, ReentrancyGuard, Pausable {
         EscrowRecord storage esc = _escrow[invoiceId];
         if (esc.released) revert EscrowAlreadyReleased(invoiceId);
 
-        esc.frozen = false; // unfreeze before release / refund helpers
-
         if (releaseToMerchant) {
-            _releaseEscrowToMerchant(invoiceId, inv.merchant, inv.payer, esc);
-            emit DisputeResolved(invoiceId, "RELEASE", msg.sender);
+            // Feature 3: instead of releasing immediately, open a payer challenge window.
+            // Funds remain frozen until the deadline; payer may call challengeDispute()
+            // within the window. After the deadline, anyone calls finalizeResolution().
+            _disputeChallengeDeadline[invoiceId] = block.timestamp + challengeWindowDuration;
+            inv.status = InvoiceStatus.CHALLENGE_PENDING;
+            emit DisputeResolved(invoiceId, "CHALLENGE_PENDING", msg.sender);
         } else {
+            esc.frozen = false;
             _refundEscrowToPayer(invoiceId, inv.payer, esc);
             emit DisputeResolved(invoiceId, "REFUND", msg.sender);
+            inv.status = InvoiceStatus.COMPLETED;
         }
-
-        inv.status = InvoiceStatus.COMPLETED;
     }
 
     /**
@@ -1088,7 +1217,9 @@ contract CryptoPaymentPlatform is Ownable, ReentrancyGuard, Pausable {
         // Only PAID and DISPUTED invoices have populated escrow records.
         // Calling on any other status means no escrow exists and the call
         // would silently succeed with zero amounts while corrupting invoice state.
-        if (inv.status != InvoiceStatus.PAID && inv.status != InvoiceStatus.DISPUTED) {
+        if (inv.status != InvoiceStatus.PAID &&
+            inv.status != InvoiceStatus.DISPUTED &&
+            inv.status != InvoiceStatus.CHALLENGE_PENDING) {
             revert InvalidInvoiceStatus(invoiceId, inv.status);
         }
         EscrowRecord storage esc = _escrow[invoiceId];
@@ -1101,12 +1232,17 @@ contract CryptoPaymentPlatform is Ownable, ReentrancyGuard, Pausable {
     }
 
     /**
-     * @notice Admin or employee force-refunds escrow to the payer outside
-     *         the formal dispute flow.
+     * @notice Admin or employee refunds some or all of the escrowed amount to
+     *         the payer. Supports both full and partial refunds.
      *
-     * @param invoiceId Invoice whose escrow is to be refunded to payer.
+     * @dev    If `refundAmount` equals the full escrow: full refund, no fee.
+     *         If `refundAmount` is less: the remainder is released to the merchant
+     *         after deducting the platform fee on the remainder only.
+     *
+     * @param invoiceId    Invoice whose escrow is to be (partially) refunded.
+     * @param refundAmount Amount to return to the payer (≤ escrow amount).
      */
-    function adminRefundToPayer(uint256 invoiceId)
+    function adminRefundToPayer(uint256 invoiceId, uint256 refundAmount)
         external
         nonReentrant
         whenNotPaused
@@ -1114,17 +1250,40 @@ contract CryptoPaymentPlatform is Ownable, ReentrancyGuard, Pausable {
         invoiceExists(invoiceId)
     {
         Invoice storage inv      = _invoices[invoiceId];
-        // Only PAID and DISPUTED invoices have populated escrow records.
-        // Calling on any other status means no escrow exists and the call
-        // would silently succeed with zero amounts while corrupting invoice state.
-        if (inv.status != InvoiceStatus.PAID && inv.status != InvoiceStatus.DISPUTED) {
+        // Accepts PAID, DISPUTED, and CHALLENGE_PENDING (escrow still populated).
+        if (inv.status != InvoiceStatus.PAID &&
+            inv.status != InvoiceStatus.DISPUTED &&
+            inv.status != InvoiceStatus.CHALLENGE_PENDING) {
             revert InvalidInvoiceStatus(invoiceId, inv.status);
         }
         EscrowRecord storage esc = _escrow[invoiceId];
         if (esc.released) revert EscrowAlreadyReleased(invoiceId);
+        if (refundAmount > esc.amount) {
+            revert PartialRefundExceedsEscrow(invoiceId, refundAmount, esc.amount);
+        }
 
         esc.frozen = false;
-        _refundEscrowToPayer(invoiceId, inv.payer, esc);
+
+        if (refundAmount == esc.amount) {
+            // Full refund — entire escrow returned to payer, no fee deducted.
+            _refundEscrowToPayer(invoiceId, inv.payer, esc);
+        } else {
+            // Partial refund: `refundAmount` to payer; remainder to merchant minus fee.
+            address token     = esc.token;
+            uint256 remainder = esc.amount - refundAmount;
+
+            esc.released = true;
+
+            _ledger[inv.payer][token] += refundAmount;
+            emit FundsRefunded(invoiceId, inv.payer, refundAmount);
+
+            (uint256 fee, uint256 net) = _calculateFee(inv.merchant, remainder, token);
+            _ledger[inv.merchant][token] += net;
+            _ledger[owner()][token]      += fee;
+            emit FeeDeducted(invoiceId, fee, token);
+            emit FundsReleased(invoiceId, inv.merchant, net);
+        }
+
         inv.status = InvoiceStatus.COMPLETED;
     }
 
@@ -1308,6 +1467,7 @@ contract CryptoPaymentPlatform is Ownable, ReentrancyGuard, Pausable {
         subscriptionToken    = token;
         subscriptionFee      = fee;
         subscriptionDuration = duration;
+        emit SubscriptionConfigUpdated(token, fee, duration);
     }
 
     /**
@@ -1341,6 +1501,7 @@ contract CryptoPaymentPlatform is Ownable, ReentrancyGuard, Pausable {
         FeeConfig storage userCfg = _userFeeConfig[merchant];
 
         if (userCfg.isSet) {
+            // Per-user override takes full precedence; tier discount does not apply.
             if (userCfg.feeType == FeeType.PERCENTAGE) {
                 fee = (amount * userCfg.value) / BPS_DENOMINATOR;
             } else {
@@ -1349,16 +1510,98 @@ contract CryptoPaymentPlatform is Ownable, ReentrancyGuard, Pausable {
                 fee = flat > amount ? amount : flat;
             }
         } else {
+            // No per-user override — compute base fee then apply tier discount.
+            uint256 baseFee;
             if (defaultFeeConfig.feeType == FeeType.PERCENTAGE) {
-                fee = (amount * defaultFeeConfig.value) / BPS_DENOMINATOR;
+                baseFee = (amount * defaultFeeConfig.value) / BPS_DENOMINATOR;
             } else {
                 // FLAT: use the global per-token flat amount
                 uint256 flat = defaultFlatFeePerToken[token];
-                fee = flat > amount ? amount : flat;
+                baseFee = flat > amount ? amount : flat;
+            }
+
+            // Feature 8: apply tier discount (e.g. GOLD 2000 bps = 20% off the fee).
+            uint256 discount = _tierDiscount[_userTier[merchant]];
+            if (discount > 0) {
+                uint256 reduction = (baseFee * discount) / BPS_DENOMINATOR;
+                fee = baseFee - reduction;
+            } else {
+                fee = baseFee;
             }
         }
 
+        // Minimum fee floor: if the configured rate is non-zero but the computed
+        // fee rounded down to zero (tiny amounts), charge at least 1 base unit.
+        if (fee == 0 && amount > 0) {
+            bool hasRate;
+            if (userCfg.isSet) {
+                hasRate = userCfg.feeType == FeeType.PERCENTAGE
+                    ? userCfg.value > 0
+                    : _userFlatFeePerToken[merchant][token] > 0;
+            } else {
+                hasRate = defaultFeeConfig.feeType == FeeType.PERCENTAGE
+                    ? defaultFeeConfig.value > 0
+                    : defaultFlatFeePerToken[token] > 0;
+            }
+            if (hasRate) fee = 1;
+        }
+
         net = amount - fee;
+    }
+
+    /**
+     * @dev Computes the platform fee using ONLY the global default fee config,
+     *      ignoring any per-user overrides and tier discounts. Used for P2P
+     *      internal transfers so the base platform rate always applies regardless
+     *      of the sender's tier or custom merchant rate.
+     *
+     * @param amount Gross payment amount in token base units.
+     * @param token  Token address (used for flat-fee lookup).
+     * @return fee   Platform fee.
+     * @return net   Recipient net after fee deduction.
+     */
+    function _calculateDefaultFee(uint256 amount, address token)
+        internal
+        view
+        returns (uint256 fee, uint256 net)
+    {
+        if (defaultFeeConfig.feeType == FeeType.PERCENTAGE) {
+            fee = (amount * defaultFeeConfig.value) / BPS_DENOMINATOR;
+        } else {
+            uint256 flat = defaultFlatFeePerToken[token];
+            fee = flat > amount ? amount : flat;
+        }
+
+        // Minimum fee floor: charge at least 1 base unit when the rate is non-zero.
+        if (fee == 0 && amount > 0) {
+            bool hasRate = defaultFeeConfig.feeType == FeeType.PERCENTAGE
+                ? defaultFeeConfig.value > 0
+                : defaultFlatFeePerToken[token] > 0;
+            if (hasRate) fee = 1;
+        }
+
+        net = amount - fee;
+    }
+
+    /**
+     * @dev Derives a calendar month key (YYYYMM) from a Unix timestamp using
+     *      pure integer arithmetic (Howard Hinnant's civil-from-days algorithm).
+     *      The key resets on the 1st of each calendar month.
+     *
+     * @param timestamp Unix timestamp in seconds.
+     * @return          Month key as `year * 100 + month` (e.g. 202601 for Jan 2026).
+     */
+    function _getMonthKey(uint256 timestamp) internal pure returns (uint256) {
+        uint256 z   = timestamp / 86400 + 719468;
+        uint256 era = z / 146097;
+        uint256 doe = z - era * 146097;
+        uint256 yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+        uint256 y   = yoe + era * 400;
+        uint256 doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        uint256 mp  = (5 * doy + 2) / 153;
+        uint256 m   = mp < 10 ? mp + 3 : mp - 9;
+        if (m <= 2) y++;
+        return y * 100 + m;
     }
 
     // =========================================================================
@@ -1771,6 +2014,368 @@ contract CryptoPaymentPlatform is Ownable, ReentrancyGuard, Pausable {
     }
 
     // =========================================================================
+    //  SECTION 15 — INVOICE EDIT  (Feature 2)
+    // =========================================================================
+
+    /**
+     * @notice Merchant edits a PENDING invoice before the payer has paid.
+     *         Non-recurring fields (`amount`, `dueDate`, `description`) are always
+     *         editable. `recurringInterval` and `maxCycles` may only be changed on
+     *         recurring invoices. Pass 0 / empty string for fields you do not wish
+     *         to update.
+     *
+     * @param invoiceId            Invoice to modify (must be PENDING).
+     * @param newAmount            New gross amount in token base units (0 = keep current).
+     * @param newDueDate           New overall expiry timestamp (0 = keep current).
+     * @param newDescription       New description (empty string = keep current).
+     * @param newRecurringInterval New cycle interval in seconds (0 = keep current).
+     * @param newMaxCycles         New maximum number of cycles (0 = keep current).
+     */
+    function editInvoice(
+        uint256 invoiceId,
+        uint256 newAmount,
+        uint256 newDueDate,
+        string calldata newDescription,
+        uint256 newRecurringInterval,
+        uint256 newMaxCycles
+    )
+        external
+        whenNotPaused
+        invoiceExists(invoiceId)
+    {
+        Invoice storage inv = _invoices[invoiceId];
+        bool isMerchantOwner = msg.sender == inv.merchant;
+        bool privileged      = msg.sender == owner() || isEmployee[msg.sender];
+        if (!isMerchantOwner && !privileged) revert Unauthorized();
+        if (inv.status != InvoiceStatus.PENDING) revert InvoiceNotEditable(invoiceId);
+
+        if (newAmount != 0)                    inv.amount = newAmount;
+        if (newDueDate != 0) {
+            if (newDueDate <= block.timestamp) revert InvoiceDueDatePassed(invoiceId);
+            inv.dueDate = newDueDate;
+        }
+        if (bytes(newDescription).length > 0) inv.description = newDescription;
+        if (inv.isRecurring) {
+            if (newRecurringInterval != 0) inv.recurringInterval = newRecurringInterval;
+            if (newMaxCycles != 0) {
+                if (newMaxCycles < inv.completedCycles) revert InvalidAmount();
+                inv.maxCycles = newMaxCycles;
+            }
+        }
+
+        // Signal payer that the invoice has changed; they must call acknowledgeInvoice
+        // before payPrepaidInvoice will succeed.
+        inv.payerAcknowledged = false;
+
+        emit InvoiceEdited(invoiceId, msg.sender, block.timestamp);
+    }
+
+    /**
+     * @notice Payer acknowledges an edited invoice, re-enabling payment.
+     *
+     * @dev    After `editInvoice` is called, `payerAcknowledged` is set to false
+     *         and `payPrepaidInvoice` will revert until the payer calls this function.
+     *         Only the invoice's assigned payer may call it, and only while PENDING.
+     *
+     * @param invoiceId Invoice to acknowledge.
+     */
+    function acknowledgeInvoice(uint256 invoiceId)
+        external
+        whenNotPaused
+        invoiceExists(invoiceId)
+    {
+        Invoice storage inv = _invoices[invoiceId];
+        if (msg.sender != inv.payer) revert Unauthorized();
+        if (inv.status != InvoiceStatus.PENDING) {
+            revert InvalidInvoiceStatus(invoiceId, inv.status);
+        }
+        inv.payerAcknowledged = true;
+        emit InvoiceAcknowledged(invoiceId, msg.sender);
+    }
+
+    // =========================================================================
+    //  SECTION 16 — DISPUTE CHALLENGE WINDOW  (Feature 3)
+    // =========================================================================
+
+    /**
+     * @notice Payer contests a merchant-wins dispute ruling while the challenge
+     *         window is still open. Resets the invoice to DISPUTED status so the
+     *         admin or employee can re-examine the case.
+     *
+     * @param invoiceId Invoice in CHALLENGE_PENDING state.
+     * @param evidence  Text or reference supporting the challenge.
+     */
+    function challengeDispute(uint256 invoiceId, string calldata evidence)
+        external
+        whenNotPaused
+        invoiceExists(invoiceId)
+    {
+        Invoice storage inv = _invoices[invoiceId];
+        if (msg.sender != inv.payer) revert Unauthorized();
+        if (inv.status != InvoiceStatus.CHALLENGE_PENDING) {
+            revert InvalidInvoiceStatus(invoiceId, inv.status);
+        }
+        if (block.timestamp > _disputeChallengeDeadline[invoiceId]) {
+            revert ChallengeWindowExpired(invoiceId, _disputeChallengeDeadline[invoiceId]);
+        }
+        if (_challengeCount[invoiceId] >= maxChallengesPerInvoice) {
+            revert MaxChallengesReached(invoiceId);
+        }
+
+        // Escrow remains frozen; only status changes so admin can re-adjudicate.
+        _challengeCount[invoiceId]++;
+        inv.status = InvoiceStatus.DISPUTED;
+        emit DisputeChallenged(invoiceId, msg.sender, evidence);
+        emit FundsHeld(invoiceId, evidence);
+    }
+
+    /**
+     * @notice Finalises a merchant-wins ruling once the payer challenge window
+     *         has expired without a challenge. Releases escrowed funds to the
+     *         merchant after deducting the platform fee.
+     *
+     * @dev    Callable by anyone after the deadline — the outcome is immutable
+     *         at that point and no privileged role is required.
+     *
+     * @param invoiceId Invoice in CHALLENGE_PENDING state whose deadline has passed.
+     */
+    function finalizeResolution(uint256 invoiceId)
+        external
+        nonReentrant
+        whenNotPaused
+        invoiceExists(invoiceId)
+    {
+        Invoice storage inv = _invoices[invoiceId];
+        if (inv.status != InvoiceStatus.CHALLENGE_PENDING) {
+            revert InvalidInvoiceStatus(invoiceId, inv.status);
+        }
+        uint256 deadline = _disputeChallengeDeadline[invoiceId];
+        if (block.timestamp <= deadline) revert ResolutionNotReady(invoiceId, deadline);
+
+        EscrowRecord storage esc = _escrow[invoiceId];
+        if (esc.released) revert EscrowAlreadyReleased(invoiceId);
+
+        esc.frozen = false;
+        _releaseEscrowToMerchant(invoiceId, inv.merchant, inv.payer, esc);
+        inv.status = InvoiceStatus.COMPLETED;
+        emit DisputeResolved(invoiceId, "FINALIZED", msg.sender);
+    }
+
+    /**
+     * @notice Admin sets the duration of the payer challenge window.
+     * @param duration New window length in seconds (e.g. 7 days, 30 days).
+     */
+    function setChallengeWindow(uint256 duration) external onlyAdmin {
+        if (duration < 1 days) revert InvalidAmount();
+        challengeWindowDuration = duration;
+    }
+
+    /**
+     * @notice Admin sets the maximum number of times a payer may challenge a
+     *         single invoice's dispute ruling (default 1).
+     * @param max New cap (0 = no challenges allowed after the first ruling).
+     */
+    function setMaxChallenges(uint256 max) external onlyAdmin {
+        maxChallengesPerInvoice = max;
+    }
+
+    // =========================================================================
+    //  SECTION 17 — P2P INTERNAL TRANSFER  (Feature 4 + Feature 7)
+    // =========================================================================
+
+    /**
+     * @notice Transfers an internal ledger balance from the caller to another user.
+     *         Platform fee applies; the `isFamilyTransfer` flag enables fee-free
+     *         transfers up to the recipient's monthly `freeReceiveLimit`.
+     *
+     * @dev    Fee is computed using the global default fee config only (no per-user
+     *         overrides, no tier discounts) via `_calculateDefaultFee`. The monthly
+     *         receive count is keyed to the *recipient* using a calendar month key
+     *         (YYYYMM) and is always incremented for family transfers regardless of
+     *         whether the fee-free threshold has been reached.
+     *
+     * @param recipient        Destination wallet (must differ from caller).
+     * @param token            Supported token (including NATIVE_ETH / address(0)).
+     * @param amount           Gross amount to deduct from the caller's ledger.
+     * @param isFamilyTransfer When true: treated as a family / friends transfer.
+     *                         No fee is charged if the recipient has not yet reached
+     *                         their monthly free-receive limit; the count is always
+     *                         incremented for tracking.
+     */
+    function transferToUser(
+        address recipient,
+        address token,
+        uint256 amount,
+        bool isFamilyTransfer
+    )
+        external
+        nonReentrant
+        whenNotPaused
+        onlySupportedToken(token)
+    {
+        if (recipient == msg.sender)  revert CannotTransferToSelf();
+        if (recipient == address(0))  revert ZeroAddress();
+        if (amount == 0)              revert InvalidAmount();
+
+        uint256 bal = _ledger[msg.sender][token];
+        if (bal < amount) revert InsufficientBalance(msg.sender, token, amount, bal);
+
+        uint256 fee;
+        uint256 net;
+
+        if (isFamilyTransfer) {
+            uint256 monthKey = _getMonthKey(block.timestamp);
+            if (_monthlyReceiveCount[recipient][monthKey] < freeReceiveLimit) {
+                // Under the limit — fee-free
+                fee = 0;
+                net = amount;
+            } else {
+                (fee, net) = _calculateDefaultFee(amount, token);
+            }
+            // Always increment so the limit is enforced regardless of fee result
+            _monthlyReceiveCount[recipient][monthKey]++;
+        } else {
+            (fee, net) = _calculateDefaultFee(amount, token);
+        }
+
+        // --- Effects (CEI) ---
+        _ledger[msg.sender][token]  -= amount;
+        _ledger[recipient][token]   += net;
+        if (fee > 0) _ledger[owner()][token] += fee;
+
+        nonces[msg.sender]++;
+
+        // --- Events ---
+        emit InternalTransfer(msg.sender, recipient, token, net);
+        // type(uint256).max signals a P2P transfer fee rather than an invoice fee.
+        if (fee > 0) emit FeeDeducted(type(uint256).max, fee, token);
+    }
+
+    /**
+     * @notice Admin sets the maximum number of fee-free family transfers a wallet
+     *         may receive per 30-day window.
+     * @param limit New monthly limit (0 = always charge a fee on family transfers).
+     */
+    function setFreeReceiveLimit(uint256 limit) external onlyAdmin {
+        freeReceiveLimit = limit;
+    }
+
+    /**
+     * @notice Returns how many family transfers a wallet has received in the
+     *         current 30-day window.
+     * @param user Recipient wallet to query.
+     * @return     Count for the current 30-day window.
+     */
+    function getMonthlyReceiveCount(address user) external view returns (uint256) {
+        return _monthlyReceiveCount[user][_getMonthKey(block.timestamp)];
+    }
+
+    // =========================================================================
+    //  SECTION 18 — EXTERNAL WALLET & WITHDRAWAL PERMISSION  (Features 5 & 6)
+    // =========================================================================
+
+    /**
+     * @notice Registers an external wallet for the caller. Once registered, all
+     *         calls to `withdrawETH` / `withdrawToken` require admin-granted
+     *         external-withdrawal permission before they succeed.
+     *
+     * @param externalWallet External wallet to associate (not zero, not self).
+     */
+    function registerExternalWallet(address externalWallet) external {
+        if (externalWallet == address(0)) revert ZeroAddress();
+        if (externalWallet == msg.sender) revert CannotRegisterOwnAddress();
+        _externalWallet[msg.sender] = externalWallet;
+        emit ExternalWalletRegistered(msg.sender, externalWallet);
+    }
+
+    /**
+     * @notice Removes the caller's registered external wallet, restoring
+     *         unrestricted withdrawal access.
+     */
+    function removeExternalWallet() external {
+        // Require admin-granted permission before the user can deregister their
+        // external wallet. This ensures admin has reviewed the account before the
+        // withdrawal gate is removed.
+        if (!_canWithdrawExternal[msg.sender]) revert ExternalWithdrawNotApproved(msg.sender);
+        _externalWallet[msg.sender] = address(0);
+        emit ExternalWalletRemoved(msg.sender);
+    }
+
+    /**
+     * @notice Returns the external wallet registered for a given user.
+     * @param user Wallet to query.
+     * @return     Registered external wallet (address(0) if none).
+     */
+    function getExternalWallet(address user) external view returns (address) {
+        return _externalWallet[user];
+    }
+
+    /**
+     * @notice Admin grants or revokes external-withdrawal permission for a user.
+     *         Only effective for users who have a registered external wallet.
+     *
+     * @param user  User wallet to update.
+     * @param value true = allow withdrawal; false = block withdrawal.
+     */
+    function setExternalWithdrawPermission(address user, bool value) external onlyAdmin {
+        if (user == address(0)) revert ZeroAddress();
+        _canWithdrawExternal[user] = value;
+        emit ExternalWithdrawPermissionUpdated(user, value);
+    }
+
+    /**
+     * @notice Returns whether a user holds admin-granted external-withdrawal permission.
+     * @param user Wallet to query.
+     * @return     True if permission has been granted.
+     */
+    function canWithdrawExternal(address user) external view returns (bool) {
+        return _canWithdrawExternal[user];
+    }
+
+    // =========================================================================
+    //  SECTION 19 — USER TIER CLASSIFICATION  (Feature 8)
+    // =========================================================================
+
+    /**
+     * @notice Admin or employee assigns a loyalty tier to a user. The tier
+     *         determines the fee discount applied when the user acts as a merchant
+     *         and has no per-user fee override configured.
+     *
+     * @param user User wallet to classify.
+     * @param tier New tier (STANDARD, SILVER, GOLD, or PLATINUM).
+     */
+    function setUserTier(address user, UserTier tier) external onlyAdminOrEmployee {
+        if (user == address(0)) revert ZeroAddress();
+        _userTier[user] = tier;
+        emit UserTierUpdated(user, tier);
+    }
+
+    /**
+     * @notice Admin sets the fee discount for a specific tier.
+     *         The discount is expressed in basis points and is applied to the
+     *         computed base fee (not the invoice amount).
+     *
+     * @dev    Example: base fee = 100 tokens, GOLD discount = 2 000 bps →
+     *         reduction = 100 × 2000 / 10000 = 20 → effective fee = 80 tokens.
+     *
+     * @param tier        Tier to configure.
+     * @param discountBps Discount in basis points (max 10 000 = 100% of the fee).
+     */
+    function setTierDiscount(UserTier tier, uint256 discountBps) external onlyAdmin {
+        if (discountBps > BPS_DENOMINATOR) revert InvalidFeeConfig();
+        _tierDiscount[tier] = discountBps;
+    }
+
+    /**
+     * @notice Returns the current loyalty tier for a given user.
+     * @param user Wallet to query.
+     * @return     UserTier enum value.
+     */
+    function getUserTier(address user) external view returns (UserTier) {
+        return _userTier[user];
+    }
+
+    // =========================================================================
     //  RECEIVE — plain ETH sends credited as deposits
     // =========================================================================
 
@@ -1781,7 +2386,7 @@ contract CryptoPaymentPlatform is Ownable, ReentrancyGuard, Pausable {
      */
     receive() external payable {
         // Block deposits while paused so the pause mechanism covers all fund entry points.
-        if (paused()) revert EnforcedPause();
+        if (paused()) revert ContractMustBePaused();
         if (msg.value > 0) {
             _ledger[msg.sender][NATIVE_ETH] += msg.value;
             emit Deposit(msg.sender, NATIVE_ETH, msg.value);

@@ -1,6 +1,6 @@
 # CryptoPaymentPlatform
 
-A production-grade Solidity smart contract for the Arbitrum blockchain that combines a gas-efficient pool-vault internal ledger with a full invoice payment system, escrow management, and on-chain dispute resolution — all in a single deployable contract.
+A production-grade Solidity smart contract for the Arbitrum blockchain that combines a gas-efficient pool-vault internal ledger with a full invoice payment system, escrow management, on-chain dispute resolution, P2P internal transfers, and a tiered loyalty fee system — all in a single deployable contract.
 
 > **Who this README is for:** Developers who are comfortable with JavaScript, REST APIs, and databases but may not have deep blockchain or Solidity experience. Where blockchain concepts appear, plain-English explanations are provided before the technical detail.
 
@@ -23,18 +23,21 @@ A production-grade Solidity smart contract for the Arbitrum blockchain that comb
 10. [Dispute Resolution](#10-dispute-resolution)
 11. [Fee System](#11-fee-system)
 12. [Subscription System](#12-subscription-system)
-13. [Function Reference](#13-function-reference)
-14. [Events Reference](#14-events-reference)
-15. [Custom Errors Reference](#15-custom-errors-reference)
-16. [Data Structures](#16-data-structures)
-17. [Deployment Guide](#17-deployment-guide)
-18. [Post-Deployment Configuration](#18-post-deployment-configuration)
-19. [Security Model](#19-security-model)
-20. [Gas Optimization](#20-gas-optimization)
-21. [Integration Guide](#21-integration-guide)
-22. [Emergency Procedures](#22-emergency-procedures)
-23. [Upgrade Path](#23-upgrade-path)
-24. [Changelog](#24-changelog)
+13. [P2P Internal Transfers](#13-p2p-internal-transfers)
+14. [External Wallet & Withdrawal Permission](#14-external-wallet--withdrawal-permission)
+15. [User Tier Classification](#15-user-tier-classification)
+16. [Function Reference](#16-function-reference)
+17. [Events Reference](#17-events-reference)
+18. [Custom Errors Reference](#18-custom-errors-reference)
+19. [Data Structures](#19-data-structures)
+20. [Deployment Guide](#20-deployment-guide)
+21. [Post-Deployment Configuration](#21-post-deployment-configuration)
+22. [Security Model](#22-security-model)
+23. [Gas Optimization](#23-gas-optimization)
+24. [Integration Guide](#24-integration-guide)
+25. [Emergency Procedures](#25-emergency-procedures)
+26. [Upgrade Path](#26-upgrade-path)
+27. [Changelog](#27-changelog)
 
 ---
 
@@ -45,11 +48,13 @@ CryptoPaymentPlatform is a crypto payment infrastructure layer built for the Arb
 - **Gas efficiency** — internal transfers between users cost 5,000–10,000 gas instead of ~65,000 gas for a normal token transfer, because no tokens physically move between wallets during payment. The contract maintains an internal ledger and only updates numbers in a database-like table.
 - **Single custody point** — all funds from all users sit inside one contract. There are no per-user wallet deployments or proxy contracts.
 - **Complete payment lifecycle** — supports prepaid (escrow-backed), postpaid (instant settle), and recurring (pull-payment) invoice models in one contract.
-- **Built-in dispute resolution** — admin and employees can adjudicate disputes and direct escrowed funds without requiring external arbitration.
-- **Flexible fee model** — percentage-based or per-token flat fees, configurable globally or per merchant.
+- **Built-in dispute resolution** — admin and employees can adjudicate disputes with a configurable payer challenge window to ensure fair outcomes.
+- **Flexible fee model** — percentage-based or per-token flat fees, configurable globally or per merchant, with a tiered loyalty discount system.
+- **P2P transfers** — users can transfer balances directly to each other with optional fee-free family/friends transfer mode.
+- **External wallet security** — users can register an external wallet and require admin approval before any withdrawals are allowed.
 
-**Contract version:** `1.2.0`
-**Solidity version:** `^0.8.20`
+**Contract version:** `1.4.0`  
+**Solidity version:** `^0.8.20`  
 **Target network:** Arbitrum One / Arbitrum Nova
 
 ---
@@ -89,6 +94,12 @@ Escrow is a holding mechanism where funds are locked in a neutral place until a 
 
 Think of it like a payment held in a third-party account until both sides confirm the transaction is done.
 
+### What is a challenge window?
+
+When admin resolves a dispute in the merchant's favour, the payer gets a time window (default 30 days) to challenge that ruling before the money is actually released. If the payer does nothing within that window, anyone can call `finalizeResolution` to complete the release. If the payer disagrees, they call `challengeDispute` to reopen the case for re-adjudication.
+
+Think of it like an appeal period after a court ruling.
+
 ### What is gas?
 
 Gas is the fee paid to process a transaction on the blockchain. On Arbitrum, gas fees are very small (usually fractions of a cent). Every function call that changes state costs gas, paid by the person calling the function.
@@ -121,22 +132,23 @@ Every participant (admin, merchant, payer) is identified by their wallet address
 │  ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐  │
 │  │   Invoice    │  │    Escrow    │  │   Recurring      │  │
 │  │   Storage    │  │   Records    │  │   Approvals      │  │
-│  │  _invoices   │  │   _escrow   │  │  _recurring      │  │
+│  │  _invoices   │  │   _escrow    │  │  _recurring      │  │
 │  │  [invoiceId] │  │  [invoiceId] │  │  Approvals       │  │
 │  └──────────────┘  └──────────────┘  └──────────────────┘  │
 │                                                             │
-│  ┌────────────────────────────────────────────────────┐    │
-│  │              Fee Configuration                     │    │
-│  │  defaultFeeConfig + defaultFlatFeePerToken         │    │
-│  │  _userFeeConfig   + _userFlatFeePerToken           │    │
-│  └────────────────────────────────────────────────────┘    │
+│  ┌──────────────────┐  ┌──────────────────────────────┐    │
+│  │  Fee Config      │  │  User Tiers & External       │    │
+│  │  defaultFeeConfig│  │  Wallets                     │    │
+│  │  _userFeeConfig  │  │  _userTier / _externalWallet │    │
+│  │  _tierDiscount   │  │  _canWithdrawExternal        │    │
+│  └──────────────────┘  └──────────────────────────────┘    │
 └─────────────────────────────────────────────────────────────┘
          ▲ deposit / withdraw (real token transfers)
          ▼
    User Wallets / External
 ```
 
-**Key principle:** Real ERC-20 or ETH transfers happen only on deposit and withdrawal functions. Every payment, fee deduction, subscription charge, and escrow release is a pure ledger arithmetic operation — like updating rows in a database. No external token calls occur during payment, which eliminates reentrancy risk on payment paths and keeps gas costs low.
+**Key principle:** Real ERC-20 or ETH transfers happen only on deposit and withdrawal functions. Every payment, fee deduction, subscription charge, escrow release, and P2P transfer is a pure ledger arithmetic operation — like updating rows in a database. No external token calls occur during payment, which eliminates reentrancy risk on payment paths and keeps gas costs low.
 
 ---
 
@@ -155,11 +167,14 @@ Exclusive admin capabilities:
 - Add and remove employees (`addEmployee`, `removeEmployee`)
 - Register merchants (`registerMerchant`)
 - Pause and unpause the contract (`pause`, `unpause`)
-- Configure global and per-user fees (`setDefaultFee`, `setDefaultFlatFee`, `setUserFee`, `setUserFlatFee`)
+- Configure global and per-user fees (`setDefaultFee`, `setDefaultFlatFee`)
 - Configure subscription settings (`setSubscriptionConfig`)
 - Whitelist and delist tokens (`addSupportedToken`, `removeSupportedToken`)
-- Set maximum open invoice cap (`setMaxOpenInvoices`)
 - Execute emergency withdrawal (`emergencyWithdrawAll`)
+- Grant/revoke external withdrawal permission (`setExternalWithdrawPermission`)
+- Configure tier discounts (`setTierDiscount`)
+- Set monthly free-receive limit (`setFreeReceiveLimit`)
+- Configure dispute challenge window duration (`setChallengeWindow`)
 
 ### Employee
 
@@ -169,7 +184,8 @@ Employee capabilities (shared with admin):
 - Resolve disputes (`resolveDispute`)
 - Force-release or force-refund escrow (`adminReleaseToMerchant`, `adminRefundToPayer`)
 - Set and remove per-user fee overrides (`setUserFee`, `setUserFlatFee`, `removeUserFee`)
-- Batch cancel invoices (`batchCancelInvoices`)
+- Assign user tiers (`setUserTier`)
+- Cancel invoices (PENDING or ACTIVE) via `cancelInvoice`
 
 ### Merchant
 
@@ -177,6 +193,7 @@ Any wallet registered by the admin via `registerMerchant`. Merchants must have a
 
 Merchant capabilities:
 - Create invoices (`createInvoice`)
+- Edit their own PENDING invoices (`editInvoice`)
 - Cancel their own PENDING invoices (`cancelInvoice`)
 - Mark prepaid invoices as complete (`markComplete`)
 - Trigger recurring payment cycles (`triggerRecurring`)
@@ -191,24 +208,34 @@ Payer capabilities:
 - Pay invoices (`payPrepaidInvoice`, `payPostpaidInvoice`)
 - Reject pending invoices before paying (`rejectInvoice`)
 - Raise disputes on paid prepaid invoices (`raiseDispute`)
+- Challenge a merchant-wins ruling within the challenge window (`challengeDispute`)
 - Grant and revoke recurring payment approvals (`approveRecurring`, `revokeRecurring`)
 - Deposit and withdraw funds
+- Register an external wallet (`registerExternalWallet`)
+- Send P2P transfers (`transferToUser`)
 
 ### Access Control Matrix
 
-| Action | Admin | Employee | Merchant | Payer |
-|--------|-------|----------|----------|-------|
+| Action | Admin | Employee | Merchant | Payer/Any |
+|--------|-------|----------|----------|-----------|
 | Register merchant | ✅ | ❌ | ❌ | ❌ |
 | Add / remove employee | ✅ | ❌ | ❌ | ❌ |
 | Pause contract | ✅ | ❌ | ❌ | ❌ |
 | Create invoice | ❌ | ❌ | ✅ | ❌ |
-| Pay invoice | ❌ | ❌ | ❌ | ✅ |
+| Edit PENDING invoice | ❌ | ❌ | ✅ (own) | ❌ |
+| Pay invoice | ❌ | ❌ | ❌ | ✅ (payer) |
 | Mark complete | ❌ | ❌ | ✅ | ❌ |
-| Raise dispute | ❌ | ❌ | ❌ | ✅ |
+| Raise dispute | ❌ | ❌ | ❌ | ✅ (payer) |
+| Challenge ruling | ❌ | ❌ | ❌ | ✅ (payer) |
 | Resolve dispute | ✅ | ✅ | ❌ | ❌ |
+| Finalize resolution | ✅ | ✅ | ✅ | ✅ (after deadline) |
 | Set global fee | ✅ | ❌ | ❌ | ❌ |
 | Set user fee | ✅ | ✅ | ❌ | ❌ |
-| Batch cancel | ✅ | ✅ | ❌ | ❌ |
+| Assign user tier | ✅ | ✅ | ❌ | ❌ |
+| Set tier discount | ✅ | ❌ | ❌ | ❌ |
+| Grant external withdraw permission | ✅ | ❌ | ❌ | ❌ |
+| Register external wallet | ✅ | ✅ | ✅ | ✅ |
+| P2P transfer | ✅ | ✅ | ✅ | ✅ |
 | Emergency withdraw | ✅ | ❌ | ❌ | ❌ |
 | Deposit / withdraw | ✅ | ✅ | ✅ | ✅ |
 
@@ -286,16 +313,11 @@ platform.withdrawToken(usdt, 50_000_000); // 50 USDT
 
 // Withdraw a specific amount of ETH to your wallet
 platform.withdrawETH(0.5 ether);
-
-// Sweep all balances for multiple tokens in one call
-address[] memory tokens = new address[](3);
-tokens[0] = address(0); // ETH
-tokens[1] = usdt;
-tokens[2] = usdc;
-platform.withdrawAllTokens(tokens);
 ```
 
 > **Note on delisted tokens:** `withdrawToken` intentionally does NOT check whether a token is currently whitelisted. If admin removes a token from the supported list, existing holders can still withdraw their balance. The whitelist only controls whether new deposits and invoices can be created for that token.
+
+> **Note on external wallet registration:** If you have registered an external wallet (see Section 14), you also need admin-granted withdrawal permission before `withdrawETH` or `withdrawToken` will succeed. This is an optional security feature — if you have not registered an external wallet, withdrawals work normally.
 
 ### Checking balances
 
@@ -347,9 +369,26 @@ uint256 invoiceId = platform.createInvoice(
 );
 ```
 
+### Editing an invoice
+
+A merchant can edit any PENDING invoice before the payer has paid. Once the invoice has been paid or cancelled, it can no longer be edited.
+
+```solidity
+platform.editInvoice(
+    invoiceId,
+    600_000_000,               // new amount: 600 USDT (0 = keep current)
+    block.timestamp + 14 days, // new due date (0 = keep current)
+    "Updated scope: logo + brand guide", // new description ("" = keep current)
+    0,                         // new recurring interval (0 = keep current)
+    0                          // new max cycles (0 = keep current)
+);
+```
+
+`recurringInterval` and `maxCycles` are only editable on recurring invoices. Pass `0` or an empty string for any field you do not want to change.
+
 ### Invoice lifecycle states
 
-Every invoice moves through states like a state machine. Here is the full flow:
+Every invoice moves through states like a state machine. Here is the full flow including the challenge window:
 
 ```
                   ┌──────────────────────────────┐
@@ -360,17 +399,30 @@ Every invoice moves through states like a state machine. Here is the full flow:
                     ▼           ▼          ▼
                   PAID      COMPLETED    ACTIVE ──► (more cycles)
                     │                      │
-          markComplete │     final cycle   │
-          or dispute   │                   ▼
+          markComplete│     final cycle    │
+          or dispute  │                   ▼
                     ▼                 COMPLETED
                 DISPUTED
                     │
-           resolveDispute
-                    ▼
-                COMPLETED
+           resolveDispute(false)   resolveDispute(true)
+                    │                    │
+                    ▼                    ▼
+                COMPLETED        CHALLENGE_PENDING
+                                         │
+                          challengeDispute() ◄── payer challenges
+                                  │
+                             DISPUTED (re-opened)
+                                  │
+                              resolveDispute
+                                         │
+                          no challenge + deadline passed
+                                  │
+                          finalizeResolution()
+                                  │
+                              COMPLETED
 
    Any PENDING or ACTIVE invoice → CANCELLED
-   (via cancelInvoice / rejectInvoice / batchCancelInvoices)
+   (via cancelInvoice / rejectInvoice / emergencyWithdrawAll)
 ```
 
 | Status | What it means |
@@ -381,6 +433,7 @@ Every invoice moves through states like a state machine. Here is the full flow:
 | `COMPLETED` | Invoice fully settled — job done, all cycles done, or dispute resolved |
 | `CANCELLED` | Invoice voided by merchant, payer, admin, or emergency shutdown |
 | `DISPUTED` | Payer opened a dispute; escrow is frozen, nobody can access the funds |
+| `CHALLENGE_PENDING` | Admin ruled merchant-wins; payer has a time window to challenge before funds are released |
 
 ### Invoice IDs
 
@@ -397,20 +450,7 @@ uint256[] memory ids = platform.getMerchantInvoices(merchantAddress);
 
 // Get all invoice IDs assigned to a payer
 uint256[] memory ids = platform.getPayerInvoices(payerAddress);
-
-// Get how many non-terminal invoices a merchant currently has open
-uint256 open = platform.getOpenInvoiceCount(merchantAddress);
 ```
-
-### Open invoice cap
-
-The admin can limit how many non-terminal invoices (PENDING + ACTIVE + PAID + DISPUTED) a merchant may hold at the same time. This prevents spam:
-
-```solidity
-platform.setMaxOpenInvoices(50); // 50 maximum open invoices per merchant; 0 = unlimited
-```
-
-When this limit is changed, a `MaxOpenInvoicesUpdated` event is emitted so the backend can track the configuration change.
 
 ---
 
@@ -537,12 +577,6 @@ platform.revokeRecurring(merchantAddress, usdtAddress);
     platform.getRecurringApproval(payerAddress, merchantAddress, usdtAddress);
 ```
 
-**Listing all merchants a payer has ever approved:**
-```solidity
-address[] memory merchants = platform.getPayerApprovedMerchants(payerAddress);
-// Note: may include revoked approvals — check getRecurringApproval for current active status
-```
-
 ---
 
 ## 9. Escrow System
@@ -565,13 +599,30 @@ struct EscrowRecord {
 | Trigger | Function | Who can call | Outcome |
 |---------|----------|-------------|---------|
 | Normal completion | `markComplete` | Merchant | Net → merchant ledger; fee → admin ledger |
-| Dispute: merchant wins | `resolveDispute(id, true, reason)` | Admin / Employee | Net → merchant ledger; fee → admin ledger |
 | Dispute: payer wins | `resolveDispute(id, false, reason)` | Admin / Employee | Full amount → payer ledger (no fee deducted) |
+| Dispute: merchant wins (stage 1) | `resolveDispute(id, true, reason)` | Admin / Employee | Status → `CHALLENGE_PENDING`; payer has challenge window |
+| Payer challenges ruling | `challengeDispute(id, evidence)` | Payer (within window) | Status reverts to `DISPUTED` for re-adjudication |
+| Challenge window expires | `finalizeResolution(id)` | Anyone | Net → merchant ledger; fee → admin ledger |
 | Admin force-release | `adminReleaseToMerchant(id)` | Admin / Employee | Net → merchant ledger; fee → admin ledger |
-| Admin force-refund | `adminRefundToPayer(id)` | Admin / Employee | Full amount → payer ledger (no fee deducted) |
+| Admin full refund | `adminRefundToPayer(id, escrowAmount)` | Admin / Employee | Full amount → payer ledger (no fee) |
+| Admin partial refund | `adminRefundToPayer(id, partialAmount)` | Admin / Employee | `partialAmount` → payer; remainder (minus fee) → merchant |
 | Emergency shutdown | `emergencyWithdrawAll(...)` | Admin (paused only) | Full amount → payer's wallet directly |
 
-> **Note:** `adminReleaseToMerchant` and `adminRefundToPayer` only work on invoices in `PAID` or `DISPUTED` status. Calling them on any other status (e.g. a PENDING invoice with no escrow) will revert with `InvalidInvoiceStatus`. This prevents admin from accidentally completing unpaid invoices.
+> **Note:** `adminReleaseToMerchant` and `adminRefundToPayer` only work on invoices in `PAID` or `DISPUTED` status. Calling them on any other status will revert with `InvalidInvoiceStatus`.
+
+### Partial refunds
+
+`adminRefundToPayer` accepts a `refundAmount` parameter, allowing the admin to issue a partial refund:
+
+```solidity
+// Full refund — all escrow back to payer, no fee charged
+platform.adminRefundToPayer(invoiceId, escrowAmount); // pass full amount
+
+// Partial refund — 60% back to payer, 40% (minus fee) to merchant
+uint256 escrow = 500_000_000; // 500 USDT locked
+platform.adminRefundToPayer(invoiceId, 300_000_000); // 300 USDT to payer
+// Contract auto-releases remaining 200 USDT to merchant minus platform fee
+```
 
 ### Inspecting escrow
 
@@ -584,7 +635,7 @@ struct EscrowRecord {
 
 ## 10. Dispute Resolution
 
-> Disputes work like a chargeback system. If a payer is unhappy after paying a prepaid invoice, they can raise a dispute which freezes the funds. An admin or employee then investigates and decides who gets the money.
+> Disputes work like a chargeback system with a built-in appeals process. If a payer is unhappy after paying a prepaid invoice, they can raise a dispute which freezes the funds. An admin or employee investigates and decides who gets the money — but if they rule in the merchant's favour, the payer still gets a window to appeal before the funds are released.
 
 Only payers can raise disputes, and only on PREPAID invoices in PAID status (i.e. after payment but before the merchant marks it complete).
 
@@ -604,40 +655,77 @@ What happens immediately:
 An admin or employee investigates the situation off-chain (checks deliverables, messages, evidence) and then calls:
 
 ```solidity
-// Decision: merchant wins — release net amount to merchant
+// Decision: merchant wins — opens a challenge window for the payer
 platform.resolveDispute(invoiceId, true, "Deliverables verified against brief.");
 
-// Decision: payer wins — full refund to payer with no fee charged
+// Decision: payer wins — full refund immediately, no appeal window
 platform.resolveDispute(invoiceId, false, "Merchant missed deadline per contract.");
 ```
 
+**When payer wins (`false`):**
+- Escrow is unfrozen immediately
+- Full amount refunded to payer's ledger (no fee)
+- Invoice status → `COMPLETED`
+- Events: `DisputeResolved` ("REFUND"), `FundsRefunded`
+
+**When merchant wins (`true`) — the challenge window:**
+- Invoice status → `CHALLENGE_PENDING`
+- A deadline is set (default: 30 days from now)
+- Escrow remains frozen until the deadline or a challenge
+- Events: `DisputeResolved` ("CHALLENGE_PENDING")
+
+### Payer challenging the ruling
+
+During the challenge window, the payer can reopen the case:
+
+```solidity
+platform.challengeDispute(
+    invoiceId,
+    "Admin did not review the contract clause 4B — merchant missed a key deliverable."
+);
+```
+
 What happens:
-- Escrow is unfrozen
-- Funds are directed to the winner's internal ledger
-- Invoice status changes to `COMPLETED`
-- Events emitted: `DisputeResolved`, then either `FundsReleased` (merchant wins) or `FundsRefunded` (payer wins)
+- Invoice status reverts to `DISPUTED`
+- Escrow stays frozen
+- Admin/employee must adjudicate again
+- Events: `DisputeChallenged`, `FundsHeld`
 
-### Important rules
+If the payer does not challenge within the window, anyone can call `finalizeResolution` to release funds to the merchant:
 
-- Frozen escrow cannot be touched by anyone except through the dispute resolution functions
-- Refunds always return the full invoice amount with zero fee deducted
-- Releases always deduct the platform fee before crediting the merchant
-- Once resolved, the invoice is `COMPLETED` and cannot be re-disputed
-- There is currently no automatic timeout on disputes — admin must resolve them manually
+```solidity
+// Callable by anyone once the challenge deadline has passed
+platform.finalizeResolution(invoiceId);
+```
+
+### Configuring the challenge window
+
+Admin can adjust how long the payer has to challenge a ruling:
+
+```solidity
+// Set challenge window to 7 days (default is 30 days)
+platform.setChallengeWindow(7 days);
+
+// Check current challenge window duration
+uint256 window = platform.challengeWindowDuration();
+```
 
 ### Admin force-release and force-refund
 
 These skip the formal dispute flow and are useful for off-chain settled cases:
 
 ```solidity
-// Admin decides to release to merchant without going through raiseDispute first
+// Admin decides to release to merchant (bypasses challenge window)
 platform.adminReleaseToMerchant(invoiceId);
 
-// Admin decides to refund payer without going through raiseDispute first
-platform.adminRefundToPayer(invoiceId);
+// Admin issues full refund to payer
+platform.adminRefundToPayer(invoiceId, escrowAmount);
+
+// Admin issues partial refund (50 USDT of 200 USDT escrow back to payer)
+platform.adminRefundToPayer(invoiceId, 50_000_000);
 ```
 
-Both functions require the invoice to be in `PAID` or `DISPUTED` status. They cannot be called on invoices that have not been paid.
+Both functions require the invoice to be in `PAID` or `DISPUTED` status.
 
 ---
 
@@ -692,16 +780,23 @@ platform.removeUserFee(merchantAddress);
 
 ### Fee resolution order
 
-When calculating the fee for a payment, the contract checks:
+When calculating the fee for a payment, the contract uses this priority order:
 
 ```
 1. Does this merchant have a custom fee override?
-   YES → PERCENTAGE mode: use their custom basis points
-         FLAT mode: use their custom per-token flat amount
-   NO  → Use the global platform default
-         PERCENTAGE mode: use the global basis points
-         FLAT mode: use the global per-token flat amount
+   YES → Use their custom rate (tier discount does NOT apply)
+         PERCENTAGE mode: custom basis points
+         FLAT mode: custom per-token flat amount
+
+   NO  → Compute base fee from global default:
+         PERCENTAGE mode: global basis points
+         FLAT mode: global per-token flat amount
+
+         Then apply tier discount (if merchant tier is above STANDARD):
+         discounted_fee = base_fee - (base_fee × discount_bps / 10,000)
 ```
+
+See Section 15 for full details on tier discounts.
 
 ### Previewing fees before paying
 
@@ -776,13 +871,185 @@ bool valid = platform.isSubscriptionValid(merchantAddress);
 // createInvoice() also checks this internally and reverts with SubscriptionExpired if invalid
 ```
 
-### Free platform
+---
 
-If `subscriptionFee` is 0, any registered merchant can call `paySubscription()` to activate themselves at no cost. If subscriptions are not needed at all, leave `subscriptionFee` at 0 and the check in `createInvoice` is skipped entirely.
+## 13. P2P Internal Transfers
+
+> Users can send their internal ledger balance to any other wallet without going through the invoice system. This works like an internal bank transfer — instant, cheap, and does not require the recipient to be a merchant. A special "family/friends" mode allows fee-free transfers up to a monthly limit.
+
+### Standard transfer
+
+```solidity
+// Send 50 USDT to a friend's wallet (platform fee applies)
+platform.transferToUser(
+    recipientAddress,
+    usdtAddress,
+    50_000_000,  // 50 USDT
+    false        // false = standard transfer (fee applies)
+);
+```
+
+The platform fee is calculated using the **sender's** tier and fee override (same as merchant invoice payments). The net amount after fee is credited to the recipient.
+
+### Family / friends transfer (fee-free up to monthly limit)
+
+```solidity
+// Send 50 USDT to a family member (fee-free if under monthly limit)
+platform.transferToUser(
+    recipientAddress,
+    usdtAddress,
+    50_000_000,
+    true  // true = family transfer (fee-free until monthly limit reached)
+);
+```
+
+How it works:
+- The contract tracks how many family transfers the **recipient** has received in the current 30-day window
+- If their count is below `freeReceiveLimit` (default: 5), no fee is charged and the full amount arrives
+- If they have already received 5 or more fee-free transfers this month, the normal platform fee applies
+- The monthly count is always incremented for family transfers (whether fee was charged or not)
+
+```solidity
+// Check how many family transfers a user has received this month
+uint256 count = platform.getMonthlyReceiveCount(recipientAddress);
+
+// Admin: change the monthly free-receive limit (default 5)
+platform.setFreeReceiveLimit(10); // raise to 10 free transfers per month
+```
+
+### Transfer rules
+
+- You cannot transfer to yourself (`CannotTransferToSelf` error)
+- The token must be supported (whitelisted)
+- Your internal balance must cover the gross amount
+- Your per-user nonce is incremented (for off-chain signature schemes)
 
 ---
 
-## 13. Function Reference
+## 14. External Wallet & Withdrawal Permission
+
+> This is a security feature for users who want an extra layer of protection. By registering an external wallet, a user signals that they may be operating in a managed or custodial environment, and an admin must explicitly approve withdrawals before they go through. If you don't register an external wallet, this feature has no effect on you.
+
+### Registering an external wallet
+
+```solidity
+// Associate your cold storage wallet with your platform account
+platform.registerExternalWallet(coldStorageWalletAddress);
+```
+
+Once registered:
+- All calls to `withdrawETH` and `withdrawToken` will fail with `ExternalWithdrawNotApproved` until admin grants permission
+- The registration is visible on-chain so your backend can track it
+
+Restrictions:
+- Cannot register `address(0)` (zero address)
+- Cannot register your own wallet address
+
+### Admin granting withdrawal permission
+
+```solidity
+// Admin approves withdrawals for a user after KYC/verification
+platform.setExternalWithdrawPermission(userAddress, true);
+
+// Admin revokes withdrawal permission (e.g. account under review)
+platform.setExternalWithdrawPermission(userAddress, false);
+```
+
+### Removing the external wallet registration
+
+A user can remove their external wallet at any time. This immediately restores unrestricted withdrawal access.
+
+```solidity
+platform.removeExternalWallet();
+```
+
+### Querying status
+
+```solidity
+// Check what external wallet a user has registered (address(0) = none)
+address ext = platform.getExternalWallet(userAddress);
+
+// Check if a user has admin-granted withdrawal permission
+bool permitted = platform.canWithdrawExternal(userAddress);
+```
+
+### Flow summary
+
+```
+User registers external wallet
+          │
+          ▼
+   withdrawETH / withdrawToken called
+          │
+          ▼
+   Has external wallet? ──NO──► withdraw succeeds normally
+          │YES
+          ▼
+   Has permission? ──NO──► revert ExternalWithdrawNotApproved
+          │YES
+          ▼
+   withdraw succeeds
+```
+
+---
+
+## 15. User Tier Classification
+
+> Tiers are a loyalty reward system. When a merchant has no custom fee override, their tier determines how much of a discount they receive on the platform fee. A GOLD merchant pays 20% less fee than the standard rate. This encourages high-volume merchants to stay on the platform.
+
+### Available tiers
+
+| Tier | Default Discount | Example: 2.5% base fee → effective fee |
+|------|-----------------|----------------------------------------|
+| `STANDARD` | 0% | 2.5% |
+| `SILVER` | 10% off base fee | 2.25% |
+| `GOLD` | 20% off base fee | 2.0% |
+| `PLATINUM` | 30% off base fee | 1.75% |
+
+The discount applies to the computed fee, not the invoice amount. If the base fee on a 1,000 USDT invoice is 25 USDT, a GOLD merchant (20% off the fee) pays 20 USDT instead of 25 USDT, and receives 980 USDT instead of 975 USDT.
+
+> **Important:** The tier discount only applies when the merchant has **no per-user fee override**. If an admin has set a custom fee rate for a merchant, that rate is used directly — the tier discount is ignored for that merchant.
+
+### Assigning tiers
+
+```solidity
+// Admin or employee promotes a merchant to GOLD tier
+platform.setUserTier(merchantAddress, UserTier.GOLD);
+
+// Check a user's current tier
+UserTier tier = platform.getUserTier(merchantAddress);
+```
+
+### Customising tier discounts
+
+Admin can change the discount percentage for any tier:
+
+```solidity
+// Give PLATINUM members a 50% discount on fees (instead of the default 30%)
+platform.setTierDiscount(UserTier.PLATINUM, 5_000); // 5000 bps = 50%
+
+// Remove discount for SILVER tier
+platform.setTierDiscount(UserTier.SILVER, 0);
+```
+
+Discount is expressed in basis points applied to the computed base fee (max: 10,000 bps = 100% of the fee, i.e. zero fee).
+
+### Discount calculation example
+
+```
+Invoice: 1,000 USDT
+Global fee: 2.5% (250 bps)
+Base fee: 1,000 × 250 / 10,000 = 25 USDT
+
+Merchant tier: GOLD (2,000 bps discount)
+Discount on fee: 25 × 2,000 / 10,000 = 5 USDT
+Effective fee: 25 - 5 = 20 USDT
+Merchant receives: 1,000 - 20 = 980 USDT
+```
+
+---
+
+## 16. Function Reference
 
 > This section is the technical API reference. Each function entry lists its visibility (who can call it from outside the contract), which security modifiers it applies, and what it does.
 
@@ -828,7 +1095,7 @@ Modifiers:  nonReentrant, whenNotPaused
 Parameters:
   amount — ETH amount in wei to send to caller's wallet
 ```
-Checks ledger balance, deducts (effect first), then sends ETH (interaction last — follows CEI pattern). Reverts if balance is insufficient or ETH transfer fails.
+Checks ledger balance, checks external wallet permission (if applicable), deducts (effect first), then sends ETH (interaction last — follows CEI pattern). Reverts if balance is insufficient, ETH transfer fails, or caller has a registered external wallet without withdrawal permission.
 
 ---
 
@@ -840,18 +1107,7 @@ Parameters:
   token  — ERC-20 contract address (not address(0))
   amount — amount in token base units
 ```
-Deducts from the caller's internal ledger, then calls `safeTransfer` to send tokens to the caller's wallet. **Does not require the token to be currently whitelisted** — users can always withdraw balances in delisted tokens. Reverts if balance is insufficient.
-
----
-
-#### `withdrawAllTokens(address[] calldata tokens)`
-```
-Visibility: external
-Modifiers:  nonReentrant, whenNotPaused
-Parameters:
-  tokens — array of token addresses to sweep (include address(0) for ETH)
-```
-Iterates the provided list and withdraws the full balance for each token with a non-zero balance. Silently skips tokens with zero balance. If an ETH send fails, the balance is restored for that token and the loop continues to sweep remaining ERC-20 tokens successfully.
+Deducts from the caller's internal ledger, checks external wallet permission (if applicable), then calls `safeTransfer` to send tokens to the caller's wallet. **Does not require the token to be currently whitelisted** — users can always withdraw balances in delisted tokens. Reverts if balance is insufficient or external wallet permission is missing.
 
 ---
 
@@ -912,29 +1168,39 @@ Visibility: external
 Modifiers:  whenNotPaused, onlySupportedToken(token)
 Caller:     merchant only (registered, subscription active)
 ```
-Creates a new invoice. Validates all inputs (including that payer is not the merchant themselves). Assigns a unique ID, stores the invoice, updates merchant and payer index arrays, increments open invoice counter. Returns the new invoice ID. Emits `InvoiceCreated`.
+Creates a new invoice. Validates all inputs (including that payer is not the merchant themselves). Assigns a unique ID and stores the invoice. Returns the new invoice ID. Emits `InvoiceCreated`.
+
+---
+
+#### `editInvoice(uint256 invoiceId, uint256 newAmount, uint256 newDueDate, string newDescription, uint256 newRecurringInterval, uint256 newMaxCycles)`
+```
+Visibility: external
+Modifiers:  whenNotPaused, invoiceExists
+Caller:     invoice merchant only, PENDING status only
+```
+Allows the merchant to update invoice fields before the payer has paid. Pass `0` or empty string for fields you do not want to change. `newRecurringInterval` and `newMaxCycles` are only applied on recurring invoices. Reverts with `InvoiceNotEditable` if the invoice is not PENDING. Emits `InvoiceEdited`.
 
 ---
 
 #### `cancelInvoice(uint256 invoiceId, string reason)`
 ```
 Visibility: external
-Modifiers:  invoiceExists(invoiceId)
+Modifiers:  invoiceExists
 Caller:     merchant (PENDING status only) | admin / employee (PENDING or ACTIVE)
 ```
-Sets status to `CANCELLED`. Decrements merchant's open invoice count. Emits `InvoiceCancelled`.
+Sets status to `CANCELLED`. Emits `InvoiceCancelled`.
 
-> **Why can't the merchant cancel an ACTIVE invoice?** ACTIVE means recurring cycles are in progress. Allowing the merchant to cancel mid-stream would let them stop billing after receiving payment for early cycles while leaving the invoice in a non-terminal state. Only admin or employee can cancel ACTIVE invoices to prevent this abuse.
+> **Why can't the merchant cancel an ACTIVE invoice?** ACTIVE means recurring cycles are in progress. Allowing the merchant to cancel mid-stream would let them stop billing after receiving payment for early cycles. Only admin or employee can cancel ACTIVE invoices.
 
 ---
 
 #### `rejectInvoice(uint256 invoiceId, string reason)`
 ```
 Visibility: external
-Modifiers:  invoiceExists(invoiceId)
+Modifiers:  invoiceExists
 Caller:     payer only, PENDING status only
 ```
-Payer-side cancellation of an invoice they have not yet paid. Sets status to `CANCELLED`. Decrements open invoice count. Emits `InvoiceCancelled`.
+Payer-side cancellation of an invoice they have not yet paid. Sets status to `CANCELLED`. Emits `InvoiceCancelled`.
 
 ---
 
@@ -956,7 +1222,7 @@ Visibility: external
 Modifiers:  nonReentrant, whenNotPaused, invoiceExists
 Caller:     invoice merchant only, PAID status only
 ```
-Releases escrowed funds to merchant minus platform fee. Sets status to `COMPLETED`. Decrements open invoice count. Reverts if escrow is frozen (dispute open) or already released. Emits `FeeDeducted`, `FundsReleased`, `InternalTransfer`, `InvoiceMarkedComplete`.
+Releases escrowed funds to merchant minus platform fee. Sets status to `COMPLETED`. Reverts if escrow is frozen (dispute open) or already released. Emits `FeeDeducted`, `FundsReleased`, `InternalTransfer`, `InvoiceMarkedComplete`.
 
 ---
 
@@ -966,7 +1232,7 @@ Visibility: external
 Modifiers:  nonReentrant, whenNotPaused, invoiceExists
 Caller:     assigned payer only
 ```
-Atomic single-step settlement: deducts gross amount from payer, credits net to merchant, credits fee to admin. Sets status to `COMPLETED`. Decrements open invoice count. Increments payer nonce. Emits `FeeDeducted`, `InternalTransfer`, `InvoicePaid`, `InvoiceMarkedComplete`.
+Atomic single-step settlement: deducts gross amount from payer, credits net to merchant, credits fee to admin. Sets status to `COMPLETED`. Increments payer nonce. Emits `FeeDeducted`, `InternalTransfer`, `InvoicePaid`, `InvoiceMarkedComplete`.
 
 ---
 
@@ -978,7 +1244,7 @@ Visibility: external
 Modifiers:  whenNotPaused, onlySupportedToken(token)
 Caller:     payer
 ```
-Creates or overwrites a recurring pull-payment authorisation. If `totalLimit == 0`, spending is unlimited. Records the merchant in the payer's approved-merchants list (deduplicated — each merchant appears only once per payer). Overwrites the full approval including resetting `totalSpent` to 0.
+Creates or overwrites a recurring pull-payment authorisation. If `totalLimit == 0`, spending is unlimited. Records the merchant in the payer's approved-merchants list (deduplicated). Overwrites the full approval including resetting `totalSpent` to 0.
 
 ---
 
@@ -997,7 +1263,7 @@ Visibility: external
 Modifiers:  nonReentrant, whenNotPaused, invoiceExists
 Caller:     invoice merchant only
 ```
-Executes one billing cycle. Performs 9 sequential validation checks (role, recurring flag, status, max cycles, timing, expiry, approval active, per-cycle limit, total limit). Settles payment from payer's ledger to merchant's ledger (minus fee). Sets status to `ACTIVE` (if cycles remain) or `COMPLETED` (if all done). Decrements open invoice count only on the final cycle. Emits `FeeDeducted`, `InternalTransfer`, `RecurringInvoiceTriggered`, and optionally `InvoiceMarkedComplete`.
+Executes one billing cycle. Performs 9 sequential validation checks (role, recurring flag, status, max cycles, timing, expiry, approval active, per-cycle limit, total limit). Settles payment from payer's ledger to merchant's ledger (minus fee). Sets status to `ACTIVE` (if cycles remain) or `COMPLETED` (if all done). Emits `FeeDeducted`, `InternalTransfer`, `RecurringInvoiceTriggered`, and optionally `InvoiceMarkedComplete`.
 
 ---
 
@@ -1018,10 +1284,38 @@ Freezes escrow. Sets status to `DISPUTED`. Emits `DisputeRaised`, `FundsHeld`.
 Visibility: external
 Modifiers:  nonReentrant, whenNotPaused, onlyAdminOrEmployee, invoiceExists
 ```
-Unfreezes escrow. Directs funds to winner. Sets status to `COMPLETED`. Decrements open invoice count.
-- `releaseToMerchant = true`: fee deducted, net credited to merchant. Emits `FeeDeducted`, `FundsReleased`.
-- `releaseToMerchant = false`: full amount refunded to payer, no fee. Emits `FundsRefunded`.
-- Always emits `DisputeResolved`.
+Resolves a DISPUTED invoice.
+- `releaseToMerchant = true`: opens a payer challenge window. Status → `CHALLENGE_PENDING`. Emits `DisputeResolved` ("CHALLENGE_PENDING").
+- `releaseToMerchant = false`: immediately refunds payer (no fee). Status → `COMPLETED`. Emits `DisputeResolved` ("REFUND"), `FundsRefunded`.
+
+---
+
+#### `challengeDispute(uint256 invoiceId, string evidence)`
+```
+Visibility: external
+Modifiers:  whenNotPaused, invoiceExists
+Caller:     payer only — CHALLENGE_PENDING status only, within deadline
+```
+Reopens a merchant-wins ruling for re-adjudication. Status reverts to `DISPUTED`. Reverts with `ChallengeWindowExpired` if the deadline has passed. Emits `DisputeChallenged`, `FundsHeld`.
+
+---
+
+#### `finalizeResolution(uint256 invoiceId)`
+```
+Visibility: external
+Modifiers:  nonReentrant, whenNotPaused, invoiceExists
+Caller:     anyone — CHALLENGE_PENDING status only, after deadline
+```
+Finalises a merchant-wins ruling once the payer challenge window has expired. Releases escrow to merchant minus fee. Status → `COMPLETED`. Reverts with `ResolutionNotReady` if deadline has not yet passed. Emits `DisputeResolved` ("FINALIZED"), `FeeDeducted`, `FundsReleased`.
+
+---
+
+#### `setChallengeWindow(uint256 duration)`
+```
+Visibility: external
+Modifiers:  onlyAdmin
+```
+Sets the duration (in seconds) of the payer challenge window. Default: 30 days.
 
 ---
 
@@ -1031,17 +1325,23 @@ Visibility: external
 Modifiers:  nonReentrant, whenNotPaused, onlyAdminOrEmployee, invoiceExists
 Requires:   invoice status must be PAID or DISPUTED
 ```
-Force-releases escrow to merchant outside the formal dispute flow. Useful for off-chain resolved cases. Emits `FeeDeducted`, `FundsReleased`, `InternalTransfer`, `InvoiceMarkedComplete`.
+Force-releases escrow to merchant outside the formal dispute flow. Bypasses the challenge window. Emits `FeeDeducted`, `FundsReleased`, `InternalTransfer`, `InvoiceMarkedComplete`.
 
 ---
 
-#### `adminRefundToPayer(uint256 invoiceId)`
+#### `adminRefundToPayer(uint256 invoiceId, uint256 refundAmount)`
 ```
 Visibility: external
 Modifiers:  nonReentrant, whenNotPaused, onlyAdminOrEmployee, invoiceExists
 Requires:   invoice status must be PAID or DISPUTED
+Parameters:
+  refundAmount — amount to return to payer (must be ≤ escrow amount)
 ```
-Force-refunds full escrow amount to payer. No fee deducted. Emits `FundsRefunded`.
+Refunds some or all of the escrowed amount to the payer.
+- **Full refund** (refundAmount == escrow amount): entire escrow to payer, no fee deducted.
+- **Partial refund** (refundAmount < escrow amount): `refundAmount` credited to payer; remainder released to merchant minus platform fee.
+
+Reverts with `PartialRefundExceedsEscrow` if `refundAmount > escrow amount`. Emits `FundsRefunded`, and optionally `FeeDeducted` + `FundsReleased` for the merchant portion.
 
 ---
 
@@ -1055,7 +1355,7 @@ Parameters:
   feeType — FeeType.PERCENTAGE or FeeType.FLAT
   value   — basis points for PERCENTAGE (max 10,000); ignored for FLAT
 ```
-Sets global fee mode. For FLAT mode, also call `setDefaultFlatFee` per token to configure amounts. Emits `FeeConfigUpdated`.
+Sets global fee mode. For FLAT mode, also call `setDefaultFlatFee` per token. Emits `FeeConfigUpdated`.
 
 ---
 
@@ -1076,7 +1376,7 @@ Sets global flat fee for a specific token. Also auto-switches the global fee mod
 Visibility: external
 Modifiers:  onlyAdminOrEmployee
 ```
-Sets a per-merchant fee override. Emits `FeeConfigUpdated`, `UserFeeTierUpdated`.
+Sets a per-merchant fee override. When set, tier discounts do not apply to this merchant. Emits `FeeConfigUpdated`, `UserFeeTierUpdated`.
 
 ---
 
@@ -1085,7 +1385,7 @@ Sets a per-merchant fee override. Emits `FeeConfigUpdated`, `UserFeeTierUpdated`
 Visibility: external
 Modifiers:  onlyAdminOrEmployee, onlySupportedToken(token)
 ```
-Sets a per-token flat fee for a specific merchant. Also marks that merchant's fee config as FLAT mode. Multiple calls for different tokens are additive — each token gets its own slot. Emits `FlatFeeUpdated`, `UserFeeTierUpdated`.
+Sets a per-token flat fee for a specific merchant. Multiple calls for different tokens are additive. Emits `FlatFeeUpdated`, `UserFeeTierUpdated`.
 
 ---
 
@@ -1094,7 +1394,7 @@ Sets a per-token flat fee for a specific merchant. Also marks that merchant's fe
 Visibility: external
 Modifiers:  onlyAdminOrEmployee
 ```
-Deletes the merchant's fee override (reverts them to the global default). Flat fee entries remain in storage but are ignored while the override is unset. Emits `FeeConfigUpdated`.
+Deletes the merchant's fee override (reverts them to the global default + tier discount). Emits `FeeConfigUpdated`.
 
 ---
 
@@ -1111,6 +1411,83 @@ Reconfigures the merchant subscription system. Reverts if `fee > 0` and the toke
 
 ---
 
+### P2P transfer functions
+
+#### `transferToUser(address recipient, address token, uint256 amount, bool isFamilyTransfer)`
+```
+Visibility: external
+Modifiers:  nonReentrant, whenNotPaused, onlySupportedToken(token)
+Parameters:
+  recipient        — destination wallet (cannot be caller)
+  token            — supported token including NATIVE_ETH (address(0))
+  amount           — gross amount to deduct from caller's ledger
+  isFamilyTransfer — if true, no fee when recipient is under their monthly free limit
+```
+Transfers internal balance from caller to recipient. Fee is calculated on the sender's tier/override. For family transfers, checks recipient's monthly receive count and skips fee if under `freeReceiveLimit`; always increments the count. Increments sender nonce. Emits `InternalTransfer`, optionally `FeeDeducted`.
+
+---
+
+#### `setFreeReceiveLimit(uint256 limit)`
+```
+Visibility: external
+Modifiers:  onlyAdmin
+```
+Sets how many fee-free family transfers a wallet may receive per 30-day window. Default: 5.
+
+---
+
+### External wallet functions
+
+#### `registerExternalWallet(address externalWallet)`
+```
+Visibility: external
+Caller:     any user
+```
+Associates an external wallet with the caller's account. After registration, `withdrawETH` and `withdrawToken` require admin-granted permission. Reverts with `ZeroAddress` or `CannotRegisterOwnAddress` if invalid. Emits `ExternalWalletRegistered`.
+
+---
+
+#### `removeExternalWallet()`
+```
+Visibility: external
+Caller:     any user
+```
+Removes the caller's external wallet registration, restoring unrestricted withdrawals. Emits `ExternalWalletRemoved`.
+
+---
+
+#### `setExternalWithdrawPermission(address user, bool value)`
+```
+Visibility: external
+Modifiers:  onlyAdmin
+```
+Grants or revokes external-withdrawal permission for a user who has a registered external wallet. Emits `ExternalWithdrawPermissionUpdated`.
+
+---
+
+### User tier functions
+
+#### `setUserTier(address user, UserTier tier)`
+```
+Visibility: external
+Modifiers:  onlyAdminOrEmployee
+```
+Assigns a loyalty tier to a user. Affects the fee discount applied when the user is a merchant without a per-user fee override. Emits `UserTierUpdated`.
+
+---
+
+#### `setTierDiscount(UserTier tier, uint256 discountBps)`
+```
+Visibility: external
+Modifiers:  onlyAdmin
+Parameters:
+  tier        — STANDARD, SILVER, GOLD, or PLATINUM
+  discountBps — discount in basis points applied to the computed base fee (max 10,000)
+```
+Configures the fee discount for a tier. Reverts with `InvalidFeeConfig` if `discountBps > 10,000`.
+
+---
+
 ### Admin control functions
 
 #### `pause()` / `unpause()`
@@ -1118,7 +1495,7 @@ Reconfigures the merchant subscription system. Reverts if `fee > 0` and the toke
 Visibility: external
 Modifiers:  onlyAdmin
 ```
-Pauses or unpauses all state-changing functions (deposits, withdrawals, payments, invoice creation, etc.). Direct ETH sends to the contract address are also blocked while paused. The emergency withdrawal function (`emergencyWithdrawAll`) remains available to admin while paused.
+Pauses or unpauses all state-changing functions (deposits, withdrawals, payments, invoice creation, etc.). Direct ETH sends to the contract address are also blocked while paused. The emergency withdrawal function remains available to admin while paused.
 
 ---
 
@@ -1130,7 +1507,7 @@ Parameters:
   token    — ERC-20 contract address (not address(0))
   decimals — decimal precision of the token (e.g. 6 for USDT/USDC, 18 for WETH)
 ```
-Whitelists a new token and stores its decimal count. `address(0)` is blocked — native ETH is pre-whitelisted in the constructor via a separate path. Emits `TokenAdded`.
+Whitelists a new token and stores its decimal count. `address(0)` is blocked — native ETH is pre-whitelisted in the constructor. Emits `TokenAdded`.
 
 ---
 
@@ -1143,36 +1520,12 @@ Removes a token from the whitelist. `address(0)` (ETH) can never be removed. Exi
 
 ---
 
-#### `setMaxOpenInvoices(uint256 limit)`
-```
-Visibility: external
-Modifiers:  onlyAdmin
-Parameters:
-  limit — max concurrent non-terminal invoices per merchant (0 = unlimited)
-```
-Sets the open invoice cap. Emits `MaxOpenInvoicesUpdated`.
-
----
-
-#### `batchCancelInvoices(uint256[] calldata invoiceIds, string calldata reason)`
-```
-Visibility: external
-Modifiers:  onlyAdminOrEmployee
-```
-Cancels all `PENDING` and `ACTIVE` invoices in the provided array in a single transaction. Silently skips non-existent IDs and invoices in states that cannot be batch-cancelled (`PAID`, `DISPUTED`, `COMPLETED`, `CANCELLED`).
-
-> **Why are PAID and DISPUTED invoices skipped in batch cancel?** Those invoices have real money locked in escrow. Batch-cancelling them would leave the escrow funds in limbo. Use `adminRefundToPayer` or `adminReleaseToMerchant` individually for each PAID or DISPUTED invoice that needs to be resolved.
-
-Emits `InvoiceCancelled` for each successfully cancelled invoice.
-
----
-
 #### `transferOwnership(address newOwner)`
 ```
 Visibility: public
 Modifiers:  onlyOwner
 ```
-Transfers admin role to a new wallet. Overrides OpenZeppelin's implementation to also emit `AdminTransferred`.
+Transfers admin role to a new wallet. Emits `AdminTransferred`.
 
 ---
 
@@ -1188,7 +1541,7 @@ Two-phase sweep that returns all funds to their rightful owners:
 
 **Phase 1 — Ledger sweep:** For each `users[i]` × `tokens[j]` combination, sends the full ledger balance directly to the user's wallet. If an ETH send fails for a user, their balance is restored so admin can retry. ERC-20 failures bubble up via SafeERC20.
 
-**Phase 2 — Escrow sweep:** For each invoice ID in `escrowInvoiceIds`, refunds the escrowed amount to the original payer's wallet and cancels the invoice. If an ETH send fails for a payer, the amount is credited to their internal ledger as a fallback so they can withdraw it once the contract is unpaused.
+**Phase 2 — Escrow sweep:** For each invoice ID in `escrowInvoiceIds`, refunds the escrowed amount to the original payer's wallet and cancels the invoice. If an ETH send fails for a payer, the amount is credited to their internal ledger as a fallback.
 
 Safe to call in batches or multiple times — already-zero balances and already-released escrows are silently skipped.
 
@@ -1209,14 +1562,17 @@ Safe to call in batches or multiple times — already-zero balances and already-
 | `getEffectiveFlatFee(merchant, token)` | `uint256` | Active flat fee for a merchant-token pair |
 | `getTokenInfo(token)` | `(bool, uint8)` | Whether the token is whitelisted and its decimals |
 | `getUserConfig(user)` | `UserConfig` | Role flags and subscription info for a wallet |
-| `getOpenInvoiceCount(merchant)` | `uint256` | Current number of non-terminal invoices |
+| `getUserTier(user)` | `UserTier` | Loyalty tier for a user |
+| `getExternalWallet(user)` | `address` | Registered external wallet (address(0) = none) |
+| `canWithdrawExternal(user)` | `bool` | Whether admin has granted withdrawal permission |
+| `getMonthlyReceiveCount(user)` | `uint256` | Family transfers received in current 30-day window |
 | `totalInvoices()` | `uint256` | Total invoices ever created (= last invoice ID) |
 | `previewFee(merchant, amount, token)` | `(fee, net)` | Simulate a fee split before submitting a transaction |
 | `isSubscriptionValid(merchant)` | `bool` | Whether a merchant's subscription is currently active |
 
 ---
 
-## 14. Events Reference
+## 17. Events Reference
 
 > Events are the blockchain equivalent of server-side logs. Your backend or indexing service listens for these events to know when something happened on-chain. Every important action in the contract emits at least one event.
 
@@ -1225,12 +1581,13 @@ Safe to call in batches or multiple times — already-zero balances and already-
 | `UserRegistered` | `user, role` | Admin registers a merchant |
 | `UserRoleUpdated` | `user, newRole` | Employee added or removed |
 | `UserFeeTierUpdated` | `user, FeeConfig` | Per-user fee changed |
+| `UserTierUpdated` | `user, tier` | Admin/employee assigns a loyalty tier |
 | `Deposit` | `user, token, amount` | Any deposit (function call or direct ETH send) |
 | `Withdrawal` | `user, token, amount` | Any successful withdrawal |
 | `TokenAdded` | `token, decimals` | Admin whitelists a new token |
 | `TokenRemoved` | `token` | Admin removes a token from the whitelist |
-| `MaxOpenInvoicesUpdated` | `newLimit` | Admin changes the open invoice cap |
 | `InvoiceCreated` | `invoiceId, merchant, payer, amount, token, paymentType, isRecurring` | New invoice created |
+| `InvoiceEdited` | `invoiceId, editor, timestamp` | Merchant edits a PENDING invoice |
 | `InvoiceCancelled` | `invoiceId, reason` | Invoice cancelled or rejected |
 | `InvoicePaid` | `invoiceId, payer, amount, timestamp` | Payer pays an invoice |
 | `InvoiceMarkedComplete` | `invoiceId, merchant` | Invoice reaches COMPLETED status |
@@ -1238,9 +1595,10 @@ Safe to call in batches or multiple times — already-zero balances and already-
 | `FundsLocked` | `invoiceId, amount` | Escrow created when payer pays prepaid invoice |
 | `FundsReleased` | `invoiceId, merchant, netAmount` | Escrow released to merchant |
 | `FundsRefunded` | `invoiceId, payer, amount` | Escrow refunded to payer |
-| `FundsHeld` | `invoiceId, reason` | Payer raises a dispute (escrow frozen) |
+| `FundsHeld` | `invoiceId, reason` | Escrow frozen (dispute raised or challenge submitted) |
 | `DisputeRaised` | `invoiceId, payer, reason` | Payer opens a dispute |
-| `DisputeResolved` | `invoiceId, decision, resolver` | Admin resolves a dispute |
+| `DisputeResolved` | `invoiceId, decision, resolver` | Admin resolves a dispute (decision: "CHALLENGE_PENDING", "REFUND", or "FINALIZED") |
+| `DisputeChallenged` | `invoiceId, challenger, evidence` | Payer challenges a merchant-wins ruling |
 | `FeeDeducted` | `invoiceId, feeAmount, token` | Platform fee credited to admin |
 | `FeeConfigUpdated` | `user, FeeConfig` | Global or per-user fee mode changed |
 | `FlatFeeUpdated` | `user, token, amount` | Per-token flat fee amount set |
@@ -1248,11 +1606,14 @@ Safe to call in batches or multiple times — already-zero balances and already-
 | `EmployeeAdded` | `employee` | Employee role granted |
 | `EmployeeRemoved` | `employee` | Employee role revoked |
 | `SubscriptionPaid` | `merchant, expiry` | Merchant pays subscription |
-| `InternalTransfer` | `from, to, token, amount` | Any ledger-to-ledger payment |
+| `InternalTransfer` | `from, to, token, amount` | Any ledger-to-ledger payment (invoices, P2P transfers, subscriptions) |
+| `ExternalWalletRegistered` | `user, externalWallet` | User registers an external wallet |
+| `ExternalWalletRemoved` | `user` | User removes their external wallet |
+| `ExternalWithdrawPermissionUpdated` | `user, canWithdraw` | Admin grants or revokes withdrawal permission |
 
 ---
 
-## 15. Custom Errors Reference
+## 18. Custom Errors Reference
 
 > Custom errors are more gas-efficient than error strings and give you precise, programmatic error handling. When a transaction reverts, decode the error to understand exactly what went wrong.
 
@@ -1264,8 +1625,10 @@ Safe to call in batches or multiple times — already-zero balances and already-
 | `InvoiceNotFound(invoiceId)` | `uint256` | No invoice exists for this ID |
 | `InvalidInvoiceStatus(invoiceId, current)` | `uint256, InvoiceStatus` | The invoice is in the wrong state for this operation |
 | `InvoiceDueDatePassed(invoiceId)` | `uint256` | The invoice's due date has already passed |
+| `InvoiceNotEditable(invoiceId)` | `uint256` | Invoice is not in PENDING status and cannot be edited |
 | `EscrowFrozen(invoiceId)` | `uint256` | A dispute is open — escrow is locked |
 | `EscrowAlreadyReleased(invoiceId)` | `uint256` | Escrow was already settled (prevents double-release) |
+| `PartialRefundExceedsEscrow(invoiceId, requested, available)` | `uint256 × 3` | refundAmount is greater than the total escrowed amount |
 | `RecurringNotApproved()` | — | Payer's recurring approval is inactive or does not exist |
 | `RecurringLimitExceeded()` | — | This cycle would exceed the per-cycle or total budget limit |
 | `MaxCyclesReached(invoiceId)` | `uint256` | All billing cycles for this invoice have been completed |
@@ -1276,12 +1639,16 @@ Safe to call in batches or multiple times — already-zero balances and already-
 | `TransactionExpired()` | — | `block.timestamp > deadline` parameter |
 | `ZeroAddress()` | — | A disallowed zero address was passed |
 | `ContractMustBePaused()` | — | Emergency function called while contract is live |
-| `MaxOpenInvoicesReached(merchant, limit)` | `address, uint256` | Merchant has hit the open invoice cap |
+| `ChallengeWindowExpired(invoiceId, deadline)` | `uint256, uint256` | Payer tried to challenge after the deadline passed |
+| `ResolutionNotReady(invoiceId, readyAt)` | `uint256, uint256` | finalizeResolution called before the challenge deadline |
+| `CannotTransferToSelf()` | — | Caller tried to transferToUser with their own address as recipient |
+| `CannotRegisterOwnAddress()` | — | Tried to register own wallet as external wallet |
+| `ExternalWithdrawNotApproved(user)` | `address` | User has external wallet registered but no withdrawal permission granted |
 | `EnforcedPause()` | — | Function called while contract is paused (including direct ETH sends) |
 
 ---
 
-## 16. Data Structures
+## 19. Data Structures
 
 > These are the on-chain data types used throughout the contract. Understanding them helps you correctly parse event data and API responses.
 
@@ -1354,18 +1721,29 @@ struct EscrowRecord {
 
 ```solidity
 // All possible invoice states
-enum InvoiceStatus { PENDING, ACTIVE, PAID, COMPLETED, CANCELLED, DISPUTED }
+enum InvoiceStatus {
+    PENDING,          // created, awaiting payment
+    ACTIVE,           // recurring: 1+ cycles paid, more remaining
+    PAID,             // prepaid: payer paid, funds in escrow
+    COMPLETED,        // fully settled
+    CANCELLED,        // voided
+    DISPUTED,         // dispute open, escrow frozen
+    CHALLENGE_PENDING // merchant-wins ruling; payer challenge window open
+}
 
 // Payment model — determines escrow behaviour
 enum PaymentType { PREPAID, POSTPAID }
 
 // Fee calculation mode
 enum FeeType { PERCENTAGE, FLAT }
+
+// User loyalty tier — affects fee discount
+enum UserTier { STANDARD, SILVER, GOLD, PLATINUM }
 ```
 
 ---
 
-## 17. Deployment Guide
+## 20. Deployment Guide
 
 ### Prerequisites
 
@@ -1448,16 +1826,18 @@ forge script script/Deploy.s.sol \
 
 ---
 
-## 18. Post-Deployment Configuration
+## 21. Post-Deployment Configuration
 
 After deploying, complete these steps before opening the platform to users.
 
 ### Step 1 — Verify deployment
 
 ```solidity
-platform.VERSION()           // should return "1.2.0"
-platform.owner()             // should return your deployer wallet address
-platform.defaultFeeConfig()  // should return (PERCENTAGE, 250, true)
+platform.VERSION()                  // should return "1.4.0"
+platform.owner()                    // should return your deployer wallet address
+platform.defaultFeeConfig()         // should return (PERCENTAGE, 250, true)
+platform.challengeWindowDuration()  // should return 30 days (2592000 seconds)
+platform.freeReceiveLimit()         // should return 5
 ```
 
 ### Step 2 — Add employees (optional but recommended)
@@ -1489,13 +1869,38 @@ platform.setDefaultFlatFee(address(0),  500_000_000_000_000);     // 0.0005 ETH 
 platform.setUserFee(vipMerchantAddress, FeeType.PERCENTAGE, 100); // 1% for VIPs
 ```
 
-### Step 5 — Set open invoice cap (optional)
+### Step 5 — Configure tier discounts (optional)
 
 ```solidity
-platform.setMaxOpenInvoices(100); // max 100 concurrent open invoices per merchant; 0 = unlimited
+// Defaults are already set in the constructor:
+// SILVER = 1,000 bps (10% off fee), GOLD = 2,000 bps (20%), PLATINUM = 3,000 bps (30%)
+
+// Override if you want different values:
+platform.setTierDiscount(UserTier.PLATINUM, 5_000); // 50% off for platinum
 ```
 
-### Step 6 — Add additional tokens (optional)
+### Step 6 — Assign tiers to high-value merchants (optional)
+
+```solidity
+platform.setUserTier(highVolumeMerchant, UserTier.GOLD);
+platform.setUserTier(enterpriseMerchant, UserTier.PLATINUM);
+```
+
+### Step 7 — Configure dispute challenge window (optional)
+
+```solidity
+// Default is 30 days; shorten if you want faster dispute resolution
+platform.setChallengeWindow(7 days); // 7-day challenge window
+```
+
+### Step 8 — Configure monthly free-receive limit (optional)
+
+```solidity
+// Default is 5; raise or lower based on your use case
+platform.setFreeReceiveLimit(10); // allow 10 fee-free family transfers per month
+```
+
+### Step 9 — Add additional tokens (optional)
 
 ```solidity
 // Add Wrapped ETH (WETH) with 18 decimals
@@ -1504,7 +1909,7 @@ platform.addSupportedToken(0x82aF49447D8a07e3bd95BD0d56f35241523fBab1, 18);
 
 ---
 
-## 19. Security Model
+## 22. Security Model
 
 ### OpenZeppelin security primitives
 
@@ -1529,12 +1934,25 @@ Every fund-moving function follows this strict order:
 
 ### Frozen escrow invariant
 
-When `EscrowRecord.frozen == true`, `markComplete` reverts with `EscrowFrozen`. The only code paths that can unfreeze escrow are `resolveDispute`, `adminReleaseToMerchant`, and `adminRefundToPayer` — all of which require the `onlyAdminOrEmployee` modifier.
+When `EscrowRecord.frozen == true`, `markComplete` reverts with `EscrowFrozen`. The only code paths that can unfreeze escrow are `resolveDispute` (refund path), `adminReleaseToMerchant`, `adminRefundToPayer`, and `finalizeResolution` — all of which are gated on appropriate access controls.
+
+### Dispute challenge window prevents hasty rulings
+
+The challenge window (`CHALLENGE_PENDING` status) ensures payers have time to appeal a merchant-wins ruling. Funds remain frozen during the window. If the payer challenges, the case returns to `DISPUTED` for re-examination. This prevents a scenario where a rushed or incorrect admin ruling permanently transfers funds to the wrong party.
+
+### External wallet withdrawal gating
+
+Users who register an external wallet cannot withdraw until admin grants permission. This is useful for:
+- Custodial accounts where an operator manages funds
+- KYC-verified withdrawal flows
+- Accounts under compliance review
+
+The gating is opt-in — users without a registered external wallet are unaffected.
 
 ### Replay protection
 
 - The `deadline` parameter on `payPrepaidInvoice` and `payPostpaidInvoice` prevents a stale signed transaction from being processed after the payer intended it to expire.
-- `nonces[user]` increments on every settled payment for use in off-chain signature verification schemes.
+- `nonces[user]` increments on every settled payment and P2P transfer for use in off-chain signature verification schemes.
 
 ### Withdrawal always allowed for delisted tokens
 
@@ -1552,12 +1970,17 @@ The `receive()` function (which handles direct ETH sends to the contract address
 
 Solidity `^0.8.20` has built-in overflow protection on all arithmetic. `unchecked` blocks are used only for loop counters and the invoice ID counter — both of which would require 2^256 iterations to overflow, which is physically impossible.
 
+### Tier discount cannot exceed 100% of fee
+
+`setTierDiscount` validates that `discountBps <= 10,000` (BPS_DENOMINATOR). This ensures the effective fee is always `>= 0` — a merchant can receive a zero fee but never a negative fee (which would mean the platform pays merchants).
+
 ### Admin key risk
 
 If the admin wallet is compromised, an attacker can:
 - Pause the contract (blocking all user operations)
 - Transfer ownership to themselves
 - Steal the admin's accumulated fee balance by calling `withdrawToken`
+- Grant arbitrary withdrawal permissions
 
 An attacker **cannot** directly steal user ledger balances or move escrowed funds to arbitrary wallets through any contract function.
 
@@ -1567,7 +1990,7 @@ Use a Gnosis Safe multisig wallet as the contract owner with at least a 2-of-3 s
 
 ---
 
-## 20. Gas Optimization
+## 23. Gas Optimization
 
 > Gas is the transaction fee on Arbitrum. Lower gas means cheaper operations. This section explains the cost of each operation and why the internal ledger design is more efficient than traditional on-chain payments.
 
@@ -1576,17 +1999,22 @@ Use a Gnosis Safe multisig wallet as the contract owner with at least a 2-of-3 s
 | Operation | Approximate gas | Notes |
 |-----------|----------------|-------|
 | Internal payment (ledger update only) | 5,000 – 10,000 | Just two number updates in the contract's database |
+| P2P transfer | 30,000 – 50,000 | Ledger updates + monthly count read/write for family transfers |
 | ERC-20 deposit | ~65,000 | Includes the external `safeTransferFrom` call to the token contract |
 | ERC-20 withdrawal | ~45,000 | Includes the external `safeTransfer` call |
 | ETH deposit | ~25,000 | Simple balance update and event |
 | ETH withdrawal | ~30,000 | Balance update plus low-level ETH send |
 | Create invoice | ~120,000 – 180,000 | Struct storage, two array pushes, description string |
+| Edit invoice | ~30,000 – 50,000 | Storage writes for changed fields only |
 | Pay prepaid invoice | ~60,000 | Two balance updates plus escrow record creation |
 | Mark complete | ~50,000 | Escrow read plus two ledger credits |
 | Pay postpaid invoice | ~55,000 | Pure ledger updates, no escrow |
 | Trigger recurring | ~70,000 | Ledger updates plus approval record update |
 | Raise dispute | ~30,000 | Two storage flag updates plus events |
-| Resolve dispute | ~55,000 | Ledger credits plus escrow flags |
+| Resolve dispute (refund) | ~50,000 | Ledger credits plus escrow flags |
+| Resolve dispute (challenge window) | ~35,000 | Just sets deadline, no fund movement |
+| Challenge dispute | ~25,000 | Status change plus event |
+| Finalize resolution | ~60,000 | Same as a normal escrow release |
 
 ### Why internal transfers are cheaper than regular token transfers
 
@@ -1607,11 +2035,12 @@ On Arbitrum, storage access costs are already much lower than Ethereum mainnet. 
 - Custom errors instead of revert strings (saves calldata bytes per failed transaction)
 - `calldata` instead of `memory` for all array and string parameters in external functions (cheaper to read)
 - Separate `isEmployee` mapping for O(1) role checking without loading the full `UserConfig` struct
-- Escrow and ledger are separate mappings — accessing escrow data does not load user configuration
+- Tier discount lookup is a single mapping read — no loops or array searches
+- External wallet permission check is two mapping reads — minimal overhead on every withdrawal
 
 ---
 
-## 21. Integration Guide
+## 24. Integration Guide
 
 ### JavaScript with ethers.js
 
@@ -1661,6 +2090,19 @@ console.log("USDT balance:", ethers.formatUnits(balance, 6)); // format with 6 d
 const [fee, net] = await platform.previewFee(merchantAddress, 500_000_000n, USDT_ADDRESS);
 console.log("Platform fee:", ethers.formatUnits(fee, 6));
 console.log("Merchant receives:", ethers.formatUnits(net, 6));
+
+// --- Send a P2P transfer (family mode) ---
+await platform.transferToUser(
+    recipientAddress,
+    USDT_ADDRESS,
+    50_000_000n,  // 50 USDT
+    true          // family transfer — fee-free if under monthly limit
+);
+
+// --- Check a user's tier ---
+// Tier enum: 0=STANDARD, 1=SILVER, 2=GOLD, 3=PLATINUM
+const tier = await platform.getUserTier(merchantAddress);
+console.log("Merchant tier:", ["STANDARD", "SILVER", "GOLD", "PLATINUM"][tier]);
 ```
 
 ### Listening for events (backend / webhook equivalent)
@@ -1677,13 +2119,27 @@ platform.on("DisputeRaised", (invoiceId, payer, reason) => {
     notifyAdminTeam({ invoiceId: invoiceId.toString(), payer, reason });
 });
 
+// Track challenge window openings (merchant-wins rulings)
+platform.on("DisputeResolved", (invoiceId, decision, resolver) => {
+    if (decision === "CHALLENGE_PENDING") {
+        console.log(`Invoice #${invoiceId} in challenge window — notify payer`);
+    }
+});
+
+// Track when a payer challenges a ruling
+platform.on("DisputeChallenged", (invoiceId, challenger, evidence) => {
+    console.log(`Invoice #${invoiceId} challenged by ${challenger}: ${evidence}`);
+    // Re-open the dispute ticket in your support system
+});
+
 // Track all incoming payments for a specific merchant
 const filter = platform.filters.InternalTransfer(null, merchantAddress, null, null);
 const events = await platform.queryFilter(filter, fromBlock, toBlock);
 
-// Track when open invoice cap changes
-platform.on("MaxOpenInvoicesUpdated", (newLimit) => {
-    console.log(`Open invoice cap changed to: ${newLimit}`);
+// Track external wallet registrations
+platform.on("ExternalWalletRegistered", (user, externalWallet) => {
+    console.log(`User ${user} registered external wallet ${externalWallet}`);
+    // Trigger KYC / approval workflow
 });
 ```
 
@@ -1693,17 +2149,18 @@ Key entities to track and how to build them from events:
 
 | Entity | Created by | Updated by |
 |--------|-----------|-----------|
-| `Invoice` | `InvoiceCreated` | `InvoicePaid`, `InvoiceCancelled`, `InvoiceMarkedComplete`, `DisputeRaised`, `DisputeResolved`, `RecurringInvoiceTriggered` |
-| `User` | `UserRegistered`, `EmployeeAdded` | `UserRoleUpdated`, `UserFeeTierUpdated` |
+| `Invoice` | `InvoiceCreated` | `InvoiceEdited`, `InvoicePaid`, `InvoiceCancelled`, `InvoiceMarkedComplete`, `DisputeRaised`, `DisputeResolved`, `DisputeChallenged`, `RecurringInvoiceTriggered` |
+| `User` | `UserRegistered`, `EmployeeAdded` | `UserRoleUpdated`, `UserFeeTierUpdated`, `UserTierUpdated` |
 | `Deposit` / `Withdrawal` | `Deposit`, `Withdrawal` | — |
 | `Escrow` | `FundsLocked` | `FundsReleased`, `FundsRefunded`, `FundsHeld` |
-| `Dispute` | `DisputeRaised` | `DisputeResolved` |
+| `Dispute` | `DisputeRaised` | `DisputeResolved`, `DisputeChallenged` |
 | `FeeCollection` | `FeeDeducted` | — |
-| `PlatformConfig` | deployment | `MaxOpenInvoicesUpdated`, `FeeConfigUpdated`, `FlatFeeUpdated`, `TokenAdded`, `TokenRemoved` |
+| `ExternalWallet` | `ExternalWalletRegistered` | `ExternalWalletRemoved`, `ExternalWithdrawPermissionUpdated` |
+| `PlatformConfig` | deployment | `FeeConfigUpdated`, `FlatFeeUpdated`, `TokenAdded`, `TokenRemoved` |
 
 ---
 
-## 22. Emergency Procedures
+## 25. Emergency Procedures
 
 ### Scenario 1 — Suspected exploit or critical bug
 
@@ -1745,32 +2202,30 @@ The function is safe to call multiple times — already-zero balances and alread
 ### Scenario 2 — Admin key compromised
 
 If the admin wallet is compromised before you can pause:
-- The attacker can pause the contract themselves (blocking all users — not ideal but they can also unpause)
+- The attacker can pause the contract themselves (blocking all users)
 - The attacker can drain the admin's accumulated fee balance via `withdrawToken`
+- The attacker can grant withdrawal permission to arbitrary users
 - The attacker **cannot** steal individual user ledger balances directly
 - The attacker can transfer ownership, permanently locking out the original admin
 
 **Prevention:** Always use a Gnosis Safe multisig (2-of-3 or higher) as the contract owner. A single compromised key cannot execute transactions on a multisig without additional signatures.
 
-### Scenario 3 — Mass dispute or spam surge
+### Scenario 3 — Large backlog of unresolved disputes
 
-Batch-cancel any PENDING or ACTIVE spam invoices in one transaction:
+For PAID or DISPUTED invoices with locked escrow, issue partial refunds where appropriate:
 
 ```solidity
-uint256[] memory ids = new uint256[](3);
-ids[0] = 101; ids[1] = 102; ids[2] = 103;
-platform.batchCancelInvoices(ids, "Platform maintenance — spam removal");
-```
+// Full refund on clearly meritless merchant claims
+platform.adminRefundToPayer(invoiceId, escrowAmount);
 
-For PAID or DISPUTED invoices with locked escrow, resolve them individually:
-```solidity
-// Refund payer for each affected invoice
-platform.adminRefundToPayer(invoiceId);
+// Partial settlement: 80% to payer, 20% to merchant for partial work
+uint256 escrow = 500_000_000; // 500 USDT
+platform.adminRefundToPayer(invoiceId, 400_000_000); // 400 USDT to payer; 100 USDT to merchant (minus fee)
 ```
 
 ---
 
-## 23. Upgrade Path
+## 26. Upgrade Path
 
 This contract is intentionally not upgradeable (no proxy pattern). The design decision prioritises:
 - Simplicity and auditability — one file, one deployment, no hidden logic
@@ -1794,6 +2249,8 @@ This contract is intentionally not upgradeable (no proxy pattern). The design de
 | Invoice history | Permanently queryable from the old contract's event logs — never lost |
 | Active escrows | Refunded to payers via emergency withdrawal |
 | Recurring approvals | Payers re-grant approvals on the new contract |
+| User tiers | Admin re-assigns tiers on the new contract |
+| External wallet registrations | Users re-register on the new contract |
 
 ### Preserving history
 
@@ -1801,61 +2258,115 @@ All events are permanently stored on-chain. A complete historical record of ever
 
 ---
 
-## 24. Changelog
+## 27. Changelog
 
-### v1.2.0 (current)
+### v1.4.0 (current)
 
-Six security and correctness fixes applied after a full internal audit:
+Eight new features added:
+
+**Feature 1 — Partial Refund**
+
+`adminRefundToPayer` now accepts a `refundAmount` parameter. When `refundAmount` equals the full escrow amount, behaviour is the same as before (full refund, no fee). When it is less, the requested amount is returned to the payer and the remainder is released to the merchant after deducting the platform fee. New error: `PartialRefundExceedsEscrow`.
+
+**Feature 2 — Invoice Edit**
+
+New `editInvoice` function allows merchants to update a PENDING invoice's amount, due date, description, and (for recurring invoices) cycle interval and max cycles. Once an invoice moves out of PENDING status it can no longer be edited. New event: `InvoiceEdited`. New error: `InvoiceNotEditable`.
+
+**Feature 3 — Dispute Challenge Window**
+
+`resolveDispute` on the merchant-wins path no longer releases funds immediately. Instead it sets the invoice to `CHALLENGE_PENDING` and records a deadline (default: 30 days). During this window, the payer can call `challengeDispute` with evidence to reopen the case. After the deadline, anyone calls `finalizeResolution` to complete the release. New functions: `challengeDispute`, `finalizeResolution`, `setChallengeWindow`. New status: `CHALLENGE_PENDING`. New public variable: `challengeWindowDuration`. New events: `DisputeChallenged`. New errors: `ChallengeWindowExpired`, `ResolutionNotReady`.
+
+**Feature 4 — P2P Internal Transfer**
+
+New `transferToUser` function enables any user to send internal ledger balance directly to another user without an invoice. Platform fee applies (calculated on the sender's tier/override). Supports all whitelisted tokens including ETH. New error: `CannotTransferToSelf`.
+
+**Feature 5 — External Wallet Registration**
+
+New `registerExternalWallet`, `removeExternalWallet`, and `getExternalWallet` functions. Users can associate an external wallet address with their account. This is used in combination with Feature 6. New events: `ExternalWalletRegistered`, `ExternalWalletRemoved`. New error: `CannotRegisterOwnAddress`.
+
+**Feature 6 — External Withdrawal Permission**
+
+`withdrawETH` and `withdrawToken` now check whether the caller has a registered external wallet. If they do, admin must explicitly grant withdrawal permission via `setExternalWithdrawPermission` before the withdrawal succeeds. New function: `canWithdrawExternal`. New event: `ExternalWithdrawPermissionUpdated`. New error: `ExternalWithdrawNotApproved`.
+
+**Feature 7 — Monthly Receive Limit for Family Transfers**
+
+Family transfers (`isFamilyTransfer = true` in `transferToUser`) are fee-free up to a per-recipient monthly limit. The limit defaults to 5 transfers per 30-day window. Admin can change it with `setFreeReceiveLimit`. The count resets automatically each window (keyed by `block.timestamp / 30 days`). New view: `getMonthlyReceiveCount`.
+
+**Feature 8 — User Tier Classification**
+
+New `UserTier` enum with values `STANDARD`, `SILVER`, `GOLD`, `PLATINUM`. Admin/employees assign tiers with `setUserTier`. Each tier carries a fee discount (in basis points) on the base platform fee, applied only when the merchant has no per-user fee override. Default discounts: SILVER 10%, GOLD 20%, PLATINUM 30% (configurable with `setTierDiscount`). New view: `getUserTier`. New event: `UserTierUpdated`.
+
+**Other changes:**
+- VERSION bumped to `1.4.0`
+
+---
+
+### v1.3.0
+
+Three features removed to reduce gas costs and contract complexity:
+
+1. **Open invoice cap system removed** — `setMaxOpenInvoices`, `getOpenInvoiceCount`, the `_openInvoiceCount` mapping, and the `MaxOpenInvoicesReached` error were all removed. The cap was adding gas overhead to every invoice state transition.
+
+2. **`batchCancelInvoices` removed** — Admin/employee bulk cancel function removed. Individual `cancelInvoice` calls remain available.
+
+3. **`withdrawAllTokens` removed** — The convenience sweep function removed. Users continue to use `withdrawETH` and `withdrawToken` for individual withdrawals.
+
+VERSION bumped to `1.3.0`.
+
+---
+
+### v1.2.0
+
+Six security and correctness fixes applied after an internal audit:
 
 **Critical fixes:**
 
 1. **`withdrawToken` — delisted token withdrawal unblocked**
-   Removed the `onlySupportedToken` modifier from `withdrawToken`. Previously, if an admin delisted a token, any user holding a balance in that token could not withdraw it — funds were permanently trapped. Now users can always withdraw balances regardless of the token's current whitelist status. The whitelist only controls new deposits and invoice creation.
+   Removed the `onlySupportedToken` modifier from `withdrawToken`. Previously, if an admin delisted a token, any user holding a balance in that token could not withdraw it — funds were permanently trapped.
 
 2. **`receive()` — pause guard added**
-   The fallback function that handles direct ETH sends to the contract address now checks `paused()` and reverts with `EnforcedPause()` when the contract is paused. Previously, users could still deposit ETH via direct send during an emergency freeze, bypassing the pause mechanism.
+   The fallback function that handles direct ETH sends now checks `paused()` and reverts with `EnforcedPause()` when the contract is paused.
 
 **Medium fixes:**
 
 3. **`adminReleaseToMerchant` / `adminRefundToPayer` — status validation added**
-   Both admin escrow functions now require the invoice to be in `PAID` or `DISPUTED` status before proceeding. Previously, calling either function on an invoice with no escrow (e.g. a PENDING postpaid invoice) would silently succeed with zero amounts while incorrectly marking the invoice as `COMPLETED` and corrupting the open invoice count.
+   Both admin escrow functions now require the invoice to be in `PAID` or `DISPUTED` status before proceeding. Previously, calling either function on an invoice with no escrow would silently succeed with zero amounts while incorrectly marking the invoice as `COMPLETED`.
 
 4. **`resolveDispute` — misleading `FundsHeld` event removed**
-   After resolving a dispute and releasing or refunding escrow, the contract was emitting a `FundsHeld` event as an "audit trail". This was semantically incorrect — `FundsHeld` means funds are being frozen, not released. Backend indexers listening to this event would incorrectly interpret a resolved dispute as a new freeze. The `DisputeResolved` event already carries the decision and reason, making the extra emit redundant and harmful.
+   After resolving a dispute, the contract was incorrectly emitting a `FundsHeld` event. `FundsHeld` means funds are being frozen, not released. This was causing backend indexers to misread resolved disputes as new freezes.
 
 **Low fixes:**
 
-5. **`setMaxOpenInvoices` — `MaxOpenInvoicesUpdated` event added**
-   Configuration changes to the open invoice cap are now emitted as events so backends and indexers can track them without having to poll the contract state.
-
-6. **VERSION bumped to `1.2.0`**
+5. **VERSION bumped to `1.2.0`**
 
 ---
 
 ### v1.1.0
 
-- Added per-token flat fee support (`defaultFlatFeePerToken`, `_userFlatFeePerToken`) eliminating cross-token decimal mismatch
+- Added per-token flat fee support eliminating cross-token decimal mismatch
 - Added `ACTIVE` invoice status for mid-stream recurring invoices, preventing merchant self-cancellation after billing starts
 - Added `tokenDecimals` registry for frontend/SDK consumers
-- Added open invoice counting and `maxOpenInvoicesPerMerchant` cap
-- Added `batchCancelInvoices` for admin bulk operations
 - Extended `emergencyWithdrawAll` to sweep escrow records in addition to ledger balances
 - Added `previewFee(merchant, amount, token)` with correct per-token flat-fee lookup
 - `_calculateFee` now accepts `token` parameter for accurate flat-fee resolution
 - `removeSupportedToken` now explicitly blocks `address(0)` / ETH
 - `setSubscriptionConfig` now validates that the subscription token is whitelisted when fee > 0
-- `withdrawAllTokens` ETH failure now restores balance and continues the loop (previously reverted the whole call)
 - `createInvoice` now rejects self-invoicing (`payer == msg.sender`)
 
 ---
 
-## Contract Constants
+## Contract Constants and Key Public Variables
 
-| Constant | Value | Description |
-|----------|-------|-------------|
-| `VERSION` | `"1.2.0"` | Deployed contract version |
-| `NATIVE_ETH` | `address(0)` | Internal sentinel representing native ETH in the ledger |
-| `BPS_DENOMINATOR` | `10_000` | 100% expressed in basis points (100 bps = 1%) |
+| Name | Type | Value / Default | Description |
+|------|------|----------------|-------------|
+| `VERSION` | `string constant` | `"1.4.0"` | Deployed contract version |
+| `NATIVE_ETH` | `address constant` | `address(0)` | Internal sentinel representing native ETH in the ledger |
+| `BPS_DENOMINATOR` | `uint256 constant` | `10_000` | 100% expressed in basis points (100 bps = 1%) |
+| `challengeWindowDuration` | `uint256 public` | `30 days` | Payer challenge window after merchant-wins ruling |
+| `freeReceiveLimit` | `uint256 public` | `5` | Monthly fee-free family transfers per recipient |
+| `subscriptionFee` | `uint256 public` | constructor arg | Monthly merchant subscription fee (0 = free) |
+| `subscriptionToken` | `address public` | constructor arg | Token used for subscription payments |
+| `subscriptionDuration` | `uint256 public` | `30 days` | Subscription validity period after payment |
 
 ---
 
