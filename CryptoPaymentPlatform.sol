@@ -1619,7 +1619,7 @@ contract CryptoPaymentPlatform is Ownable, ReentrancyGuard, Pausable {
     /**
      * @notice Admin unpauses the contract after resolving an emergency.
      */
-    function unpause() external onlyAdmin {
+    function unpause() external onlyAdmin whenPaused {
         _unpause();
     }
 
