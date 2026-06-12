@@ -53,7 +53,7 @@ CryptoPaymentPlatform is a crypto payment infrastructure layer built for the Arb
 - **P2P transfers** — users can transfer balances directly to each other with optional fee-free family/friends transfer mode.
 - **External wallet security** — users can register an external wallet and require admin approval before any withdrawals are allowed.
 
-**Contract version:** `1.4.0`  
+**Contract version:** `1.6.0`  
 **Solidity version:** `^0.8.20`  
 **Target network:** Arbitrum One / Arbitrum Nova
 
@@ -195,7 +195,8 @@ Merchant capabilities:
 - Create invoices (`createInvoice`)
 - Edit their own PENDING invoices (`editInvoice`)
 - Cancel their own PENDING invoices (`cancelInvoice`)
-- Mark prepaid invoices as complete (`markComplete`)
+- Signal work is done on prepaid invoices (`markComplete`)
+- Claim payment after the payer confirmation window expires (`claimPayment`)
 - Trigger recurring payment cycles (`triggerRecurring`)
 - Pay their subscription (`paySubscription`)
 - Deposit and withdraw funds (like any user)
@@ -206,8 +207,11 @@ Any wallet address — no registration required. The merchant specifies the paye
 
 Payer capabilities:
 - Pay invoices (`payPrepaidInvoice`, `payPostpaidInvoice`)
+- Acknowledge an edited invoice before paying (`acknowledgeInvoice`)
 - Reject pending invoices before paying (`rejectInvoice`)
-- Raise disputes on paid prepaid invoices (`raiseDispute`)
+- Confirm completed work to release escrow (`confirmCompletion`)
+- Raise disputes after merchant marks complete (`raiseDispute`)
+- Reclaim locked escrow if merchant never marks complete after dueDate (`reclaimFunds`)
 - Challenge a merchant-wins ruling within the challenge window (`challengeDispute`)
 - Grant and revoke recurring payment approvals (`approveRecurring`, `revokeRecurring`)
 - Deposit and withdraw funds
@@ -222,9 +226,13 @@ Payer capabilities:
 | Add / remove employee | ✅ | ❌ | ❌ | ❌ |
 | Pause contract | ✅ | ❌ | ❌ | ❌ |
 | Create invoice | ❌ | ❌ | ✅ | ❌ |
-| Edit PENDING invoice | ❌ | ❌ | ✅ (own) | ❌ |
+| Edit PENDING invoice | ✅ | ✅ | ✅ (own) | ❌ |
+| Acknowledge edited invoice | ❌ | ❌ | ❌ | ✅ (payer) |
 | Pay invoice | ❌ | ❌ | ❌ | ✅ (payer) |
 | Mark complete | ❌ | ❌ | ✅ | ❌ |
+| Confirm completion | ❌ | ❌ | ❌ | ✅ (payer) |
+| Reclaim funds (after dueDate) | ❌ | ❌ | ❌ | ✅ (payer) |
+| Claim payment (after timeout) | ❌ | ❌ | ✅ | ❌ |
 | Raise dispute | ❌ | ❌ | ❌ | ✅ (payer) |
 | Challenge ruling | ❌ | ❌ | ❌ | ✅ (payer) |
 | Resolve dispute | ✅ | ✅ | ❌ | ❌ |
@@ -388,38 +396,50 @@ platform.editInvoice(
 
 ### Invoice lifecycle states
 
-Every invoice moves through states like a state machine. Here is the full flow including the challenge window:
+Every invoice moves through states like a state machine. Here is the full flow:
 
 ```
-                  ┌──────────────────────────────┐
-                  │           PENDING             │ ← created here
-                  └──────────────────────────────┘
-                    │           │          │
-          payPrepaid │  payPostpaid│  triggerRecurring (1st cycle)
-                    ▼           ▼          ▼
-                  PAID      COMPLETED    ACTIVE ──► (more cycles)
-                    │                      │
-          markComplete│     final cycle    │
-          or dispute  │                   ▼
-                    ▼                 COMPLETED
-                DISPUTED
-                    │
-           resolveDispute(false)   resolveDispute(true)
-                    │                    │
-                    ▼                    ▼
-                COMPLETED        CHALLENGE_PENDING
-                                         │
-                          challengeDispute() ◄── payer challenges
-                                  │
-                             DISPUTED (re-opened)
-                                  │
-                              resolveDispute
-                                         │
-                          no challenge + deadline passed
-                                  │
-                          finalizeResolution()
-                                  │
-                              COMPLETED
+              ┌──────────────────────────────┐
+              │           PENDING             │ ← created here
+              └──────────────────────────────┘
+                │           │          │
+      payPrepaid│  payPostpaid│  triggerRecurring (1st cycle)
+                ▼           ▼          ▼
+              PAID      COMPLETED    ACTIVE ──► (more cycles)
+                │                      │
+   markComplete()│         final cycle │
+   (if payer    │                     ▼
+    hasn't      │                 COMPLETED
+    reclaimed)  ▼
+         AWAITING_CONFIRMATION
+         (7-day window opens)
+                │
+   ┌────────────┼─────────────────────────────┐
+   │            │                             │
+   │ confirmCompletion()    raiseDispute()     │ deadline passed
+   │ (payer)                (payer)           │ claimPayment()
+   │    ▼                      ▼              │ (merchant)
+   │ COMPLETED            DISPUTED            │    ▼
+   │                           │             │ COMPLETED
+   │               resolveDispute(false)  resolveDispute(true)
+   │                           │               │
+   │                           ▼               ▼
+   │                       COMPLETED   CHALLENGE_PENDING
+   │                                          │
+   │                         challengeDispute() ◄── payer challenges
+   │                                 │
+   │                            DISPUTED (re-opened)
+   │                                 │
+   │                             resolveDispute
+   │                                          │
+   │                         no challenge + deadline passed
+   │                                 │
+   │                         finalizeResolution()
+   │                                 │
+   └────────────────────────────► COMPLETED
+
+   PAID + dueDate passed + merchant never called markComplete
+   → payer calls reclaimFunds() → CANCELLED
 
    Any PENDING or ACTIVE invoice → CANCELLED
    (via cancelInvoice / rejectInvoice / emergencyWithdrawAll)
@@ -430,7 +450,8 @@ Every invoice moves through states like a state machine. Here is the full flow i
 | `PENDING` | Invoice created, waiting for payment or first recurring cycle |
 | `ACTIVE` | Recurring invoice: at least one cycle paid, more cycles remaining |
 | `PAID` | Payer has paid a prepaid invoice; money is locked in escrow |
-| `COMPLETED` | Invoice fully settled — job done, all cycles done, or dispute resolved |
+| `AWAITING_CONFIRMATION` | Merchant marked work complete; payer has a window to confirm, dispute, or do nothing |
+| `COMPLETED` | Invoice fully settled — payer confirmed, timeout elapsed, postpaid settled, or all cycles done |
 | `CANCELLED` | Invoice voided by merchant, payer, admin, or emergency shutdown |
 | `DISPUTED` | Payer opened a dispute; escrow is frozen, nobody can access the funds |
 | `CHALLENGE_PENDING` | Admin ruled merchant-wins; payer has a time window to challenge before funds are released |
@@ -479,14 +500,43 @@ platform.payPrepaidInvoice(id, deadline);
 
 At this point `200 USDT` is deducted from the payer's internal ledger and locked in escrow. No fee is taken yet.
 
-**Step 3 — Merchant completes work (status: PAID → COMPLETED)**
+**Step 3 — Merchant signals work is done (status: PAID → AWAITING_CONFIRMATION)**
 ```solidity
 platform.markComplete(id);
 ```
 
-The contract deducts the platform fee from the escrowed 200 USDT and credits the net amount to the merchant's ledger. The fee goes to the admin's ledger.
+Funds are NOT released yet. A 7-day confirmation window starts. The merchant can call this even after the invoice `dueDate` has passed, as long as the payer has not already reclaimed funds.
 
-**Step 4 — Merchant withdraws their earnings (optional)**
+**Step 4 — Payer reviews and confirms (status: AWAITING_CONFIRMATION → COMPLETED)**
+```solidity
+platform.confirmCompletion(id);
+```
+
+The contract deducts the platform fee from the escrowed 200 USDT and credits the net amount to the merchant's ledger.
+
+**Alternative — Payer disputes the work**
+```solidity
+platform.raiseDispute(id, "Deliverable did not match the brief.");
+// status → DISPUTED; escrow frozen; admin/employee resolves
+```
+
+**Alternative — Payer does nothing; window expires**
+
+After 7 days the merchant can claim:
+```solidity
+platform.claimPayment(id);
+// status → COMPLETED; funds released to merchant minus fee
+```
+
+**Alternative — Merchant never acted; due date passed**
+
+If the merchant never called `markComplete()` and the invoice `dueDate` has passed, the payer can reclaim their locked funds:
+```solidity
+platform.reclaimFunds(id);
+// status → CANCELLED; full escrow returned to payer, no fee
+```
+
+**Step 5 — Merchant withdraws their earnings (optional)**
 ```solidity
 platform.withdrawToken(usdt, platform.balanceOf(merchantAddress, usdt));
 ```
@@ -598,7 +648,11 @@ struct EscrowRecord {
 
 | Trigger | Function | Who can call | Outcome |
 |---------|----------|-------------|---------|
-| Normal completion | `markComplete` | Merchant | Net → merchant ledger; fee → admin ledger |
+| Merchant signals complete | `markComplete` | Merchant | Status → `AWAITING_CONFIRMATION`; confirmation window starts |
+| Payer confirms work | `confirmCompletion` | Payer | Net → merchant ledger; fee → admin ledger; status → `COMPLETED` |
+| Confirmation window expires | `claimPayment` | Merchant | Net → merchant ledger; fee → admin ledger; status → `COMPLETED` |
+| Merchant never acted; dueDate passed | `reclaimFunds` | Payer | Full amount → payer ledger (no fee); status → `CANCELLED` |
+| Payer disputes after markComplete | `raiseDispute` | Payer (in window) | Escrow frozen; status → `DISPUTED` |
 | Dispute: payer wins | `resolveDispute(id, false, reason)` | Admin / Employee | Full amount → payer ledger (no fee deducted) |
 | Dispute: merchant wins (stage 1) | `resolveDispute(id, true, reason)` | Admin / Employee | Status → `CHALLENGE_PENDING`; payer has challenge window |
 | Payer challenges ruling | `challengeDispute(id, evidence)` | Payer (within window) | Status reverts to `DISPUTED` for re-adjudication |
@@ -608,7 +662,7 @@ struct EscrowRecord {
 | Admin partial refund | `adminRefundToPayer(id, partialAmount)` | Admin / Employee | `partialAmount` → payer; remainder (minus fee) → merchant |
 | Emergency shutdown | `emergencyWithdrawAll(...)` | Admin (paused only) | Full amount → payer's wallet directly |
 
-> **Note:** `adminReleaseToMerchant` and `adminRefundToPayer` only work on invoices in `PAID` or `DISPUTED` status. Calling them on any other status will revert with `InvalidInvoiceStatus`.
+> **Note:** `adminReleaseToMerchant` and `adminRefundToPayer` accept invoices in `PAID`, `AWAITING_CONFIRMATION`, `DISPUTED`, or `CHALLENGE_PENDING` status — any state where escrow is still populated.
 
 ### Partial refunds
 
@@ -637,11 +691,12 @@ platform.adminRefundToPayer(invoiceId, 300_000_000); // 300 USDT to payer
 
 > Disputes work like a chargeback system with a built-in appeals process. If a payer is unhappy after paying a prepaid invoice, they can raise a dispute which freezes the funds. An admin or employee investigates and decides who gets the money — but if they rule in the merchant's favour, the payer still gets a window to appeal before the funds are released.
 
-Only payers can raise disputes, and only on PREPAID invoices in PAID status (i.e. after payment but before the merchant marks it complete).
+Only payers can raise disputes, and only on PREPAID invoices in `AWAITING_CONFIRMATION` status — i.e. after the merchant has called `markComplete()` but before the payer has confirmed or the confirmation window has expired. If the merchant has not yet called `markComplete()` and the invoice `dueDate` has passed, the payer should call `reclaimFunds()` instead.
 
 ### Raising a dispute
 
 ```solidity
+// Only valid after merchant calls markComplete() (status = AWAITING_CONFIRMATION)
 platform.raiseDispute(invoiceId, "Merchant delivered wrong files, not as agreed.");
 ```
 
@@ -889,7 +944,7 @@ platform.transferToUser(
 );
 ```
 
-The platform fee is calculated using the **sender's** tier and fee override (same as merchant invoice payments). The net amount after fee is credited to the recipient.
+The platform fee is calculated using the **global default fee config only** — no per-user merchant overrides and no tier discounts. This is intentional: the sender is not acting as a merchant in a P2P context. The net amount after fee is credited to the recipient.
 
 ### Family / friends transfer (fee-free up to monthly limit)
 
@@ -1204,6 +1259,16 @@ Payer-side cancellation of an invoice they have not yet paid. Sets status to `CA
 
 ---
 
+#### `acknowledgeInvoice(uint256 invoiceId)`
+```
+Visibility: external
+Modifiers:  whenNotPaused, invoiceExists
+Caller:     assigned payer only, PENDING status only
+```
+Re-enables payment after a merchant has edited the invoice. When `editInvoice` is called, `payerAcknowledged` is set to `false` and both `payPrepaidInvoice` and `payPostpaidInvoice` will revert with `InvoiceNotAcknowledged` until the payer calls this. On first-time invoices `payerAcknowledged` starts as `true` so this call is not needed unless the invoice has been edited. Emits `InvoiceAcknowledged`.
+
+---
+
 ### Payment functions
 
 #### `payPrepaidInvoice(uint256 invoiceId, uint256 deadline)`
@@ -1212,7 +1277,7 @@ Visibility: external
 Modifiers:  nonReentrant, whenNotPaused, invoiceExists
 Caller:     assigned payer only
 ```
-Deducts invoice amount from payer's ledger and locks it in `_escrow[invoiceId]`. Sets status to `PAID`. Increments payer nonce. Reverts if: deadline passed, wrong payment type, wrong invoice status, past due date, or insufficient balance. Emits `FundsLocked`, `InvoicePaid`.
+Deducts invoice amount from payer's ledger and locks it in `_escrow[invoiceId]`. Sets status to `PAID`. Increments payer nonce. Reverts if: deadline passed, wrong payment type, wrong invoice status, `payerAcknowledged == false` (invoice was edited and not re-acknowledged), past due date, or insufficient balance. Emits `FundsLocked`, `InvoicePaid`.
 
 ---
 
@@ -1222,7 +1287,37 @@ Visibility: external
 Modifiers:  nonReentrant, whenNotPaused, invoiceExists
 Caller:     invoice merchant only, PAID status only
 ```
-Releases escrowed funds to merchant minus platform fee. Sets status to `COMPLETED`. Reverts if escrow is frozen (dispute open) or already released. Emits `FeeDeducted`, `FundsReleased`, `InternalTransfer`, `InvoiceMarkedComplete`.
+Signals that work is done. Does **not** release funds. Sets status to `AWAITING_CONFIRMATION` and starts the confirmation window (`block.timestamp + confirmationWindow`). Works on `PAID` status regardless of whether `dueDate` has passed, provided the payer has not already called `reclaimFunds()`. Reverts if escrow is frozen or already released. Emits `WorkSubmitted` (not `InvoiceMarkedComplete` — the invoice is not complete yet).
+
+---
+
+#### `confirmCompletion(uint256 invoiceId)`
+```
+Visibility: external
+Modifiers:  nonReentrant, whenNotPaused, invoiceExists
+Caller:     assigned payer only, AWAITING_CONFIRMATION status only
+```
+Payer accepts the merchant's work, releasing escrowed funds to the merchant minus the platform fee. Sets status to `COMPLETED`. Emits `InvoiceConfirmed`, `InvoiceMarkedComplete`, `FeeDeducted`, `FundsReleased`, `InternalTransfer`.
+
+---
+
+#### `reclaimFunds(uint256 invoiceId)`
+```
+Visibility: external
+Modifiers:  nonReentrant, whenNotPaused, invoiceExists
+Caller:     assigned payer only, PAID status only, after dueDate
+```
+Payer reclaims their locked escrow when the merchant never called `markComplete()` and the invoice `dueDate` has passed. Full escrow returned to payer with no fee. Sets status to `CANCELLED`. Reverts with `InvoiceDueDateNotPassed` if the `dueDate` has not yet passed. Emits `FundsReclaimed`, `FundsRefunded`, `InvoiceCancelled`.
+
+---
+
+#### `claimPayment(uint256 invoiceId)`
+```
+Visibility: external
+Modifiers:  nonReentrant, whenNotPaused, invoiceExists
+Caller:     invoice merchant only, AWAITING_CONFIRMATION status only, after confirmation deadline
+```
+Merchant claims their payment after the payer's confirmation window has expired without a `confirmCompletion()` or `raiseDispute()` call. Releases escrow to merchant minus fee. Sets status to `COMPLETED`. Reverts with `ConfirmationWindowNotExpired` if the deadline has not passed. Emits `FeeDeducted`, `FundsReleased`, `InternalTransfer`, `InvoiceMarkedComplete`.
 
 ---
 
@@ -1232,7 +1327,7 @@ Visibility: external
 Modifiers:  nonReentrant, whenNotPaused, invoiceExists
 Caller:     assigned payer only
 ```
-Atomic single-step settlement: deducts gross amount from payer, credits net to merchant, credits fee to admin. Sets status to `COMPLETED`. Increments payer nonce. Emits `FeeDeducted`, `InternalTransfer`, `InvoicePaid`, `InvoiceMarkedComplete`.
+Atomic single-step settlement: deducts gross amount from payer, credits net to merchant, credits fee to admin. Sets status to `COMPLETED`. Increments payer nonce. Reverts with `InvoiceNotAcknowledged` if the merchant edited the invoice and the payer has not yet called `acknowledgeInvoice()`. Emits `FeeDeducted`, `InternalTransfer`, `InvoicePaid`, `InvoiceMarkedComplete`.
 
 ---
 
@@ -1273,9 +1368,9 @@ Executes one billing cycle. Performs 9 sequential validation checks (role, recur
 ```
 Visibility: external
 Modifiers:  whenNotPaused, invoiceExists
-Caller:     payer only — PREPAID invoices in PAID status only
+Caller:     payer only — PREPAID invoices in AWAITING_CONFIRMATION status only
 ```
-Freezes escrow. Sets status to `DISPUTED`. Emits `DisputeRaised`, `FundsHeld`.
+Freezes escrow. Sets status to `DISPUTED`. Only valid after the merchant has called `markComplete()` AND while the confirmation window is still open. Reverts with `ConfirmationWindowExpired` if the deadline has already passed — at that point the merchant can call `claimPayment()` instead. Emits `DisputeRaised`, `FundsHeld`.
 
 ---
 
@@ -1315,7 +1410,25 @@ Finalises a merchant-wins ruling once the payer challenge window has expired. Re
 Visibility: external
 Modifiers:  onlyAdmin
 ```
-Sets the duration (in seconds) of the payer challenge window. Default: 30 days.
+Sets the duration (in seconds) of the payer challenge window after a merchant-wins dispute ruling. Default: 30 days. Minimum: 1 day.
+
+---
+
+#### `setMaxChallenges(uint256 max)`
+```
+Visibility: external
+Modifiers:  onlyAdmin
+```
+Sets the maximum number of times a payer may challenge a single invoice's dispute ruling. Default: 1. Setting to 0 means no challenges are allowed after the first ruling.
+
+---
+
+#### `setConfirmationWindow(uint256 duration)`
+```
+Visibility: external
+Modifiers:  onlyAdmin
+```
+Sets how long (in seconds) the payer has to call `confirmCompletion()` or `raiseDispute()` after the merchant calls `markComplete()`. Default: 7 days. Minimum: 1 day.
 
 ---
 
@@ -1323,7 +1436,7 @@ Sets the duration (in seconds) of the payer challenge window. Default: 30 days.
 ```
 Visibility: external
 Modifiers:  nonReentrant, whenNotPaused, onlyAdminOrEmployee, invoiceExists
-Requires:   invoice status must be PAID or DISPUTED
+Requires:   invoice status must be PAID, AWAITING_CONFIRMATION, DISPUTED, or CHALLENGE_PENDING
 ```
 Force-releases escrow to merchant outside the formal dispute flow. Bypasses the challenge window. Emits `FeeDeducted`, `FundsReleased`, `InternalTransfer`, `InvoiceMarkedComplete`.
 
@@ -1333,7 +1446,7 @@ Force-releases escrow to merchant outside the formal dispute flow. Bypasses the 
 ```
 Visibility: external
 Modifiers:  nonReentrant, whenNotPaused, onlyAdminOrEmployee, invoiceExists
-Requires:   invoice status must be PAID or DISPUTED
+Requires:   invoice status must be PAID, AWAITING_CONFIRMATION, DISPUTED, or CHALLENGE_PENDING
 Parameters:
   refundAmount — amount to return to payer (must be ≤ escrow amount)
 ```
@@ -1423,7 +1536,7 @@ Parameters:
   amount           — gross amount to deduct from caller's ledger
   isFamilyTransfer — if true, no fee when recipient is under their monthly free limit
 ```
-Transfers internal balance from caller to recipient. Fee is calculated on the sender's tier/override. For family transfers, checks recipient's monthly receive count and skips fee if under `freeReceiveLimit`; always increments the count. Increments sender nonce. Emits `InternalTransfer`, optionally `FeeDeducted`.
+Transfers internal balance from caller to recipient. Fee uses the **global default fee config only** (no per-user overrides, no tier discounts) via `_calculateDefaultFee`. For family transfers, checks recipient's monthly calendar-month receive count and skips fee if under `freeReceiveLimit`; always increments the count. Increments sender nonce. Emits `InternalTransfer`, optionally `FeeDeducted` (with `type(uint256).max` as the invoiceId sentinel to distinguish from invoice fees).
 
 ---
 
@@ -1610,6 +1723,11 @@ Safe to call in batches or multiple times — already-zero balances and already-
 | `ExternalWalletRegistered` | `user, externalWallet` | User registers an external wallet |
 | `ExternalWalletRemoved` | `user` | User removes their external wallet |
 | `ExternalWithdrawPermissionUpdated` | `user, canWithdraw` | Admin grants or revokes withdrawal permission |
+| `SubscriptionConfigUpdated` | `token, fee, duration` | Admin reconfigures the subscription system |
+| `InvoiceAcknowledged` | `invoiceId, payer` | Payer acknowledges an edited invoice, re-enabling payment |
+| `WorkSubmitted` | `invoiceId, merchant` | Merchant calls `markComplete()` — work claimed done; confirmation window starts |
+| `InvoiceConfirmed` | `invoiceId, payer` | Payer confirms work is complete, releasing escrow to merchant |
+| `FundsReclaimed` | `invoiceId, payer` | Payer reclaimed locked escrow after merchant failed to call `markComplete()` before `dueDate` |
 
 ---
 
@@ -1638,13 +1756,17 @@ Safe to call in batches or multiple times — already-zero balances and already-
 | `InvalidFeeConfig()` | — | Basis points value exceeds 10,000 (would mean >100% fee) |
 | `TransactionExpired()` | — | `block.timestamp > deadline` parameter |
 | `ZeroAddress()` | — | A disallowed zero address was passed |
-| `ContractMustBePaused()` | — | Emergency function called while contract is live |
-| `ChallengeWindowExpired(invoiceId, deadline)` | `uint256, uint256` | Payer tried to challenge after the deadline passed |
-| `ResolutionNotReady(invoiceId, readyAt)` | `uint256, uint256` | finalizeResolution called before the challenge deadline |
-| `CannotTransferToSelf()` | — | Caller tried to transferToUser with their own address as recipient |
+| `ContractMustBePaused()` | — | `emergencyWithdrawAll` called while contract is live, or direct ETH sent to contract while paused |
+| `ChallengeWindowExpired(invoiceId, deadline)` | `uint256, uint256` | Payer tried to challenge a dispute ruling after the challenge deadline passed |
+| `ResolutionNotReady(invoiceId, readyAt)` | `uint256, uint256` | `finalizeResolution` called before the challenge deadline |
+| `CannotTransferToSelf()` | — | Caller tried to `transferToUser` with their own address as recipient |
 | `CannotRegisterOwnAddress()` | — | Tried to register own wallet as external wallet |
 | `ExternalWithdrawNotApproved(user)` | `address` | User has external wallet registered but no withdrawal permission granted |
-| `EnforcedPause()` | — | Function called while contract is paused (including direct ETH sends) |
+| `MaxChallengesReached(invoiceId)` | `uint256` | Payer has already challenged this invoice the maximum allowed number of times |
+| `InvoiceNotAcknowledged(invoiceId)` | `uint256` | Merchant edited the invoice but payer has not yet called `acknowledgeInvoice()` |
+| `ConfirmationWindowNotExpired(invoiceId, deadline)` | `uint256, uint256` | `claimPayment` called before the payer confirmation window has expired |
+| `ConfirmationWindowExpired(invoiceId, deadline)` | `uint256, uint256` | `raiseDispute` called after the payer confirmation window has already expired |
+| `InvoiceDueDateNotPassed(invoiceId)` | `uint256` | `reclaimFunds` called before the invoice `dueDate` has passed |
 
 ---
 
@@ -1671,6 +1793,7 @@ struct Invoice {
     uint256       completedCycles;   // number of cycles successfully billed so far
     uint256       nextDueDate;       // UNIX timestamp when next cycle becomes eligible
     uint256       createdAt;         // UNIX timestamp when invoice was created
+    bool          payerAcknowledged; // false after editInvoice; payer must re-ack before paying
 }
 ```
 
@@ -1722,13 +1845,14 @@ struct EscrowRecord {
 ```solidity
 // All possible invoice states
 enum InvoiceStatus {
-    PENDING,          // created, awaiting payment
-    ACTIVE,           // recurring: 1+ cycles paid, more remaining
-    PAID,             // prepaid: payer paid, funds in escrow
-    COMPLETED,        // fully settled
-    CANCELLED,        // voided
-    DISPUTED,         // dispute open, escrow frozen
-    CHALLENGE_PENDING // merchant-wins ruling; payer challenge window open
+    PENDING,                // created, awaiting payment
+    ACTIVE,                 // recurring: 1+ cycles paid, more remaining
+    PAID,                   // prepaid: payer paid, funds in escrow
+    AWAITING_CONFIRMATION,  // merchant marked complete; payer has window to confirm or dispute
+    COMPLETED,              // fully settled
+    CANCELLED,              // voided
+    DISPUTED,               // dispute open, escrow frozen
+    CHALLENGE_PENDING       // merchant-wins ruling; payer challenge window open
 }
 
 // Payment model — determines escrow behaviour
@@ -1833,11 +1957,13 @@ After deploying, complete these steps before opening the platform to users.
 ### Step 1 — Verify deployment
 
 ```solidity
-platform.VERSION()                  // should return "1.4.0"
+platform.VERSION()                  // should return "1.6.0"
 platform.owner()                    // should return your deployer wallet address
 platform.defaultFeeConfig()         // should return (PERCENTAGE, 250, true)
 platform.challengeWindowDuration()  // should return 30 days (2592000 seconds)
+platform.confirmationWindow()       // should return 7 days (604800 seconds)
 platform.freeReceiveLimit()         // should return 5
+platform.maxChallengesPerInvoice()  // should return 1
 ```
 
 ### Step 2 — Add employees (optional but recommended)
@@ -1893,14 +2019,21 @@ platform.setUserTier(enterpriseMerchant, UserTier.PLATINUM);
 platform.setChallengeWindow(7 days); // 7-day challenge window
 ```
 
-### Step 8 — Configure monthly free-receive limit (optional)
+### Step 8 — Configure prepaid confirmation window (optional)
+
+```solidity
+// Default is 7 days; adjust based on your typical turnaround expectations
+platform.setConfirmationWindow(3 days); // payer has 3 days to confirm or dispute
+```
+
+### Step 10 — Configure monthly free-receive limit (optional)
 
 ```solidity
 // Default is 5; raise or lower based on your use case
 platform.setFreeReceiveLimit(10); // allow 10 fee-free family transfers per month
 ```
 
-### Step 9 — Add additional tokens (optional)
+### Step 11 — Add additional tokens (optional)
 
 ```solidity
 // Add Wrapped ETH (WETH) with 18 decimals
@@ -1960,7 +2093,7 @@ The gating is opt-in — users without a registered external wallet are unaffect
 
 ### Pause covers all entry points
 
-The `receive()` function (which handles direct ETH sends to the contract address) checks `paused()` and reverts with `EnforcedPause()` when the contract is paused. This ensures no funds enter the contract during an emergency freeze.
+The `receive()` function (which handles direct ETH sends to the contract address) checks `paused()` and reverts with `ContractMustBePaused()` when the contract is paused. This ensures no funds enter the contract during an emergency freeze.
 
 ### Fee-on-transfer token safety
 
@@ -2260,7 +2393,66 @@ All events are permanently stored on-chain. A complete historical record of ever
 
 ## 27. Changelog
 
-### v1.4.0 (current)
+### v1.6.0 (current)
+
+**Prepaid Confirmation Flow** — `markComplete()` no longer releases escrow immediately. Instead it moves the invoice to the new `AWAITING_CONFIRMATION` status and opens a configurable payer window (default 7 days). Three new paths complete the flow:
+
+- **`confirmCompletion(invoiceId)`** — payer accepts the work; escrow released to merchant minus fee; status → `COMPLETED`.
+- **`reclaimFunds(invoiceId)`** — payer reclaims escrow when the merchant never called `markComplete()` and the invoice `dueDate` has passed; full refund, no fee; status → `CANCELLED`.
+- **`claimPayment(invoiceId)`** — merchant claims payment after the confirmation window expires without payer action; escrow released to merchant minus fee; status → `COMPLETED`.
+
+**`raiseDispute` scope change** — disputes are now only accepted on `AWAITING_CONFIRMATION` status AND within the confirmation window. The payer cannot dispute while the invoice is still in `PAID` status, nor after the confirmation window has expired.
+
+**Admin functions extended** — `adminReleaseToMerchant` and `adminRefundToPayer` now also accept `AWAITING_CONFIRMATION` status.
+
+New admin function: `setConfirmationWindow(duration)` (minimum 1 day, default 7 days).
+
+New events: `WorkSubmitted` (emitted by `markComplete()` instead of `InvoiceMarkedComplete` — invoice is not yet complete at that point), `InvoiceConfirmed`, `FundsReclaimed`.
+
+New errors: `ConfirmationWindowNotExpired`, `ConfirmationWindowExpired`, `InvoiceDueDateNotPassed`.
+
+New state: `confirmationWindow = 7 days`, `_confirmationDeadline` mapping.
+
+New state: `confirmationWindow = 7 days`, `_confirmationDeadline` mapping.
+
+VERSION bumped to `1.6.0`.
+
+---
+
+### v1.5.0
+
+Twelve targeted fixes:
+
+1. **`receive()` error** — now reverts with the contract's own `ContractMustBePaused()` error instead of the OZ internal `EnforcedPause()`, keeping error naming consistent with the rest of the contract.
+2. **`removeExternalWallet` permission check** — requires admin-granted `_canWithdrawExternal` permission before the user can deregister their external wallet. Prevents bypassing the withdrawal gate by simply removing the registered wallet.
+3. **Challenge count cap** — new `_challengeCount` mapping, `maxChallengesPerInvoice` (default 1), `setMaxChallenges(max)` admin setter, and `MaxChallengesReached` error. Payers are now limited in how many times they can challenge a single ruling.
+4. **`payerAcknowledged` flag** — new `bool payerAcknowledged` field on the `Invoice` struct. Set to `true` on `createInvoice`, set to `false` by `editInvoice`. Both `payPrepaidInvoice` and `payPostpaidInvoice` now check this flag and revert with `InvoiceNotAcknowledged` if the payer has not re-acknowledged an edited invoice. New function: `acknowledgeInvoice()`. New event: `InvoiceAcknowledged`.
+5. **Calendar month bucket** — the monthly family-transfer counter now uses a proper calendar month key (`YYYYMM`) computed via the Howard Hinnant `civil-from-days` algorithm instead of a rolling 30-day bucket (`block.timestamp / 30 days`). This makes the limit reset on the 1st of each calendar month as users would naturally expect.
+6. **P2P transfer fee isolation** — `transferToUser` now calls a new internal `_calculateDefaultFee` function that uses only the global default fee config, with no per-user merchant overrides and no tier discounts. Senders in a P2P context are not merchants, so applying merchant-specific rates was incorrect.
+7. **Minimum fee floor** — if the configured fee rate is non-zero but the arithmetic rounds down to zero (tiny payment amounts), the contract now charges 1 base unit. Applies in both `_calculateFee` and `_calculateDefaultFee`.
+8. **`adminRefundToPayer` accepts `CHALLENGE_PENDING`** — admin can now issue refunds on invoices in the challenge window, not only `PAID` and `DISPUTED`.
+9. **`editInvoice` guard** — `newMaxCycles < completedCycles` now reverts with `InvalidAmount`. Prevents accidentally setting max cycles below the already-completed count.
+10. **`SubscriptionConfigUpdated` event** — emitted at the end of `setSubscriptionConfig` whenever admin reconfigures the subscription system.
+11. **`unpause()` modifier** — `unpause` now carries `whenPaused`, making the intent self-documenting and preventing a call when the contract is already live.
+
+VERSION bumped to `1.5.0`.
+
+---
+
+### v1.4.1
+
+Four audit fixes:
+
+1. **`editInvoice` access control** — admin and employee can now edit PENDING invoices (previously only the invoice's merchant could). Consistent with how `cancelInvoice` is gated.
+2. **`adminReleaseToMerchant` accepts `CHALLENGE_PENDING`** — admin can force-release to merchant even while a payer challenge window is open, bypassing the window when needed.
+3. **`setChallengeWindow` minimum guard** — reverts with `InvalidAmount` if the supplied duration is less than 1 day. Prevents accidentally setting a zero or near-zero window.
+4. **`FeeDeducted` P2P sentinel** — `transferToUser` emits `FeeDeducted` with `type(uint256).max` as the `invoiceId` argument. This is a sentinel value distinguishing P2P transfer fees from invoice fees (which always have a real invoice ID). Backends can filter on this to avoid miscounting P2P fees as invoice fees.
+
+VERSION bumped to `1.4.1`.
+
+---
+
+### v1.4.0
 
 Eight new features added:
 
@@ -2359,10 +2551,12 @@ Six security and correctness fixes applied after an internal audit:
 
 | Name | Type | Value / Default | Description |
 |------|------|----------------|-------------|
-| `VERSION` | `string constant` | `"1.4.0"` | Deployed contract version |
+| `VERSION` | `string constant` | `"1.6.0"` | Deployed contract version |
 | `NATIVE_ETH` | `address constant` | `address(0)` | Internal sentinel representing native ETH in the ledger |
 | `BPS_DENOMINATOR` | `uint256 constant` | `10_000` | 100% expressed in basis points (100 bps = 1%) |
-| `challengeWindowDuration` | `uint256 public` | `30 days` | Payer challenge window after merchant-wins ruling |
+| `challengeWindowDuration` | `uint256 public` | `30 days` | Payer challenge window after merchant-wins dispute ruling |
+| `confirmationWindow` | `uint256 public` | `7 days` | Window for payer to confirm or dispute after merchant calls `markComplete()` |
+| `maxChallengesPerInvoice` | `uint256 public` | `1` | Max times a payer may challenge a single dispute ruling |
 | `freeReceiveLimit` | `uint256 public` | `5` | Monthly fee-free family transfers per recipient |
 | `subscriptionFee` | `uint256 public` | constructor arg | Monthly merchant subscription fee (0 = free) |
 | `subscriptionToken` | `address public` | constructor arg | Token used for subscription payments |

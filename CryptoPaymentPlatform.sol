@@ -15,6 +15,12 @@ import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
  * @title  CryptoPaymentPlatform
  * @notice Combined pool-vault ledger with invoice payment escrow and dispute
  *         resolution, designed for deployment on Arbitrum.
+ * @dev    v1.6.0 — AWAITING_CONFIRMATION status: markComplete() no longer releases
+ *         escrow immediately; payer has a configurable window (default 7 days) to
+ *         call confirmCompletion() or raiseDispute(); after the window expires the
+ *         merchant calls claimPayment(); if merchant never calls markComplete() the
+ *         payer can call reclaimFunds() once the invoice dueDate has passed.
+ *         raiseDispute() now only accepted on AWAITING_CONFIRMATION (not PAID).
  * @dev    v1.5.0 — fixes: receive() uses ContractMustBePaused, remove stray NatSpec char,
  *         removeExternalWallet requires permission, challenge-count cap with
  *         maxChallengesPerInvoice, payerAcknowledged flag on Invoice with
@@ -61,7 +67,7 @@ contract CryptoPaymentPlatform is Ownable, ReentrancyGuard, Pausable {
     // =========================================================================
 
     /// @notice Contract version — increment on each deployment.
-    string public constant VERSION = "1.5.0";
+    string public constant VERSION = "1.6.0";
 
     /// @notice Sentinel used in the internal ledger to represent native ETH.
     address public constant NATIVE_ETH = address(0);
@@ -76,13 +82,14 @@ contract CryptoPaymentPlatform is Ownable, ReentrancyGuard, Pausable {
 
     /// @notice Full lifecycle of an invoice.
     enum InvoiceStatus {
-        PENDING,           // created, awaiting first payment / first recurring cycle
-        ACTIVE,            // recurring only: ≥1 cycle completed, more remain
-        PAID,              // payer paid prepaid invoice; escrow locked
-        COMPLETED,         // merchant confirmed, postpaid settled, or all cycles done
-        CANCELLED,         // voided by merchant, payer, admin, or emergency shutdown
-        DISPUTED,          // payer raised a dispute; escrow frozen
-        CHALLENGE_PENDING  // dispute ruled merchant-wins; payer challenge window open
+        PENDING,                // created, awaiting first payment / first recurring cycle
+        ACTIVE,                 // recurring only: ≥1 cycle completed, more remain
+        PAID,                   // payer paid prepaid invoice; escrow locked
+        AWAITING_CONFIRMATION,  // merchant marked complete; payer has window to confirm or dispute
+        COMPLETED,              // payer confirmed, postpaid settled, timeout elapsed, or all cycles done
+        CANCELLED,              // voided by merchant, payer, admin, or emergency shutdown
+        DISPUTED,               // payer raised a dispute; escrow frozen
+        CHALLENGE_PENDING       // dispute ruled merchant-wins; payer challenge window open
     }
 
     /// @notice Determines escrow behaviour and timing of fee deduction.
@@ -294,6 +301,17 @@ contract CryptoPaymentPlatform is Ownable, ReentrancyGuard, Pausable {
     uint256 public maxChallengesPerInvoice = 1;
 
     // =========================================================================
+    //  STATE — Prepaid Confirmation Window  (v1.6.0)
+    // =========================================================================
+
+    /// @notice How long (seconds) the payer has to confirm or dispute after
+    ///         the merchant calls markComplete(). Default: 7 days.
+    uint256 public confirmationWindow = 7 days;
+
+    /// @dev Invoice ID → deadline by which payer must confirm or dispute.
+    mapping(uint256 => uint256) private _confirmationDeadline;
+
+    // =========================================================================
     //  STATE — External Wallet Registration  (Feature 5)
     // =========================================================================
 
@@ -413,6 +431,11 @@ contract CryptoPaymentPlatform is Ownable, ReentrancyGuard, Pausable {
     event SubscriptionConfigUpdated(address indexed token, uint256 fee, uint256 duration);
     event InvoiceAcknowledged(uint256 indexed invoiceId, address indexed payer);
 
+    // v1.6.0 additions
+    event WorkSubmitted(uint256 indexed invoiceId, address indexed merchant);
+    event InvoiceConfirmed(uint256 indexed invoiceId, address indexed payer);
+    event FundsReclaimed(uint256 indexed invoiceId, address indexed payer);
+
     // =========================================================================
     //  CUSTOM ERRORS
     // =========================================================================
@@ -451,6 +474,10 @@ contract CryptoPaymentPlatform is Ownable, ReentrancyGuard, Pausable {
     // v1.5.0 additions
     error MaxChallengesReached(uint256 invoiceId);
     error InvoiceNotAcknowledged(uint256 invoiceId);
+    // v1.6.0 additions
+    error ConfirmationWindowNotExpired(uint256 invoiceId, uint256 deadline);
+    error ConfirmationWindowExpired(uint256 invoiceId, uint256 deadline);
+    error InvoiceDueDateNotPassed(uint256 invoiceId);
 
     // =========================================================================
     //  MODIFIERS
@@ -868,7 +895,8 @@ contract CryptoPaymentPlatform is Ownable, ReentrancyGuard, Pausable {
      * @notice Payer pays a PREPAID invoice, locking the full amount in escrow.
      *
      * @dev    No platform fee is taken at this stage; the fee is deducted when
-     *         the merchant calls `markComplete` (or on dispute resolution).
+     *         the payer calls `confirmCompletion`, the merchant calls `claimPayment`
+     *         after the confirmation window expires, or on dispute resolution.
      *         A `deadline` timestamp prevents stale signed payment intents.
      *
      * @param invoiceId Invoice to pay.
@@ -915,12 +943,16 @@ contract CryptoPaymentPlatform is Ownable, ReentrancyGuard, Pausable {
     }
 
     /**
-     * @notice Merchant declares that the job is done, releasing escrowed funds
-     *         to their internal ledger minus the platform fee.
+     * @notice Merchant signals that work is done. Moves the invoice to
+     *         AWAITING_CONFIRMATION and starts the payer confirmation window.
+     *         Funds are NOT released yet — the payer must either call
+     *         confirmCompletion() or raiseDispute() within the window, or the
+     *         merchant can call claimPayment() after the window expires.
      *
-     * @dev    Reverts if the escrow is frozen by an open dispute.
+     * @dev    Works on PAID status regardless of whether the invoice dueDate has
+     *         passed, provided the payer has not already called reclaimFunds().
      *
-     * @param invoiceId Prepaid invoice to complete.
+     * @param invoiceId Prepaid invoice to mark as complete.
      */
     function markComplete(uint256 invoiceId)
         external
@@ -938,10 +970,100 @@ contract CryptoPaymentPlatform is Ownable, ReentrancyGuard, Pausable {
         if (esc.frozen)   revert EscrowFrozen(invoiceId);
         if (esc.released) revert EscrowAlreadyReleased(invoiceId);
 
-        _releaseEscrowToMerchant(invoiceId, inv.merchant, inv.payer, esc);
+        _confirmationDeadline[invoiceId] = block.timestamp + confirmationWindow;
+        inv.status = InvoiceStatus.AWAITING_CONFIRMATION;
+        emit WorkSubmitted(invoiceId, msg.sender);
+    }
 
+    /**
+     * @notice Payer confirms that work is satisfactory, releasing escrowed funds
+     *         to the merchant after deducting the platform fee.
+     *
+     * @param invoiceId Invoice in AWAITING_CONFIRMATION state.
+     */
+    function confirmCompletion(uint256 invoiceId)
+        external
+        nonReentrant
+        whenNotPaused
+        invoiceExists(invoiceId)
+    {
+        Invoice storage inv = _invoices[invoiceId];
+        if (msg.sender != inv.payer) revert Unauthorized();
+        if (inv.status != InvoiceStatus.AWAITING_CONFIRMATION) {
+            revert InvalidInvoiceStatus(invoiceId, inv.status);
+        }
+
+        EscrowRecord storage esc = _escrow[invoiceId];
+        if (esc.released) revert EscrowAlreadyReleased(invoiceId);
+
+        esc.frozen = false;
+        _releaseEscrowToMerchant(invoiceId, inv.merchant, inv.payer, esc);
         inv.status = InvoiceStatus.COMPLETED;
-        emit InvoiceMarkedComplete(invoiceId, msg.sender);
+        emit InvoiceConfirmed(invoiceId, msg.sender);
+        emit InvoiceMarkedComplete(invoiceId, inv.merchant);
+    }
+
+    /**
+     * @notice Payer reclaims their locked escrow when the merchant never called
+     *         markComplete() and the invoice dueDate has passed.
+     *
+     * @dev    Only valid on PAID status after dueDate. Once the merchant calls
+     *         markComplete() the status moves to AWAITING_CONFIRMATION and this
+     *         function is no longer available.
+     *
+     * @param invoiceId Prepaid invoice in PAID state past its dueDate.
+     */
+    function reclaimFunds(uint256 invoiceId)
+        external
+        nonReentrant
+        whenNotPaused
+        invoiceExists(invoiceId)
+    {
+        Invoice storage inv = _invoices[invoiceId];
+        if (msg.sender != inv.payer) revert Unauthorized();
+        if (inv.status != InvoiceStatus.PAID) {
+            revert InvalidInvoiceStatus(invoiceId, inv.status);
+        }
+        if (block.timestamp <= inv.dueDate) revert InvoiceDueDateNotPassed(invoiceId);
+
+        EscrowRecord storage esc = _escrow[invoiceId];
+        if (esc.released) revert EscrowAlreadyReleased(invoiceId);
+
+        esc.frozen = false;
+        _refundEscrowToPayer(invoiceId, inv.payer, esc);
+        inv.status = InvoiceStatus.CANCELLED;
+        emit FundsReclaimed(invoiceId, msg.sender);
+        emit InvoiceCancelled(invoiceId, "Merchant did not complete before due date");
+    }
+
+    /**
+     * @notice Merchant claims payment after the payer's confirmation window has
+     *         expired without a confirmCompletion() or raiseDispute() call.
+     *
+     * @param invoiceId Invoice in AWAITING_CONFIRMATION state past the confirmation deadline.
+     */
+    function claimPayment(uint256 invoiceId)
+        external
+        nonReentrant
+        whenNotPaused
+        invoiceExists(invoiceId)
+    {
+        Invoice storage inv = _invoices[invoiceId];
+        if (msg.sender != inv.merchant) revert Unauthorized();
+        if (inv.status != InvoiceStatus.AWAITING_CONFIRMATION) {
+            revert InvalidInvoiceStatus(invoiceId, inv.status);
+        }
+        if (block.timestamp <= _confirmationDeadline[invoiceId]) {
+            revert ConfirmationWindowNotExpired(invoiceId, _confirmationDeadline[invoiceId]);
+        }
+
+        EscrowRecord storage esc = _escrow[invoiceId];
+        if (esc.released) revert EscrowAlreadyReleased(invoiceId);
+
+        esc.frozen = false;
+        _releaseEscrowToMerchant(invoiceId, inv.merchant, inv.payer, esc);
+        inv.status = InvoiceStatus.COMPLETED;
+        emit InvoiceMarkedComplete(invoiceId, inv.merchant);
     }
 
     // =========================================================================
@@ -1129,10 +1251,15 @@ contract CryptoPaymentPlatform is Ownable, ReentrancyGuard, Pausable {
     // =========================================================================
 
     /**
-     * @notice Payer raises a dispute on a PAID prepaid invoice, immediately
-     *         freezing the escrow so neither party can access the funds.
+     * @notice Payer raises a dispute after the merchant has called markComplete()
+     *         but before the payer has confirmed or the confirmation window has
+     *         expired. Freezes the escrow so neither party can access the funds.
      *
-     * @param invoiceId Invoice being disputed.
+     * @dev    Only valid on AWAITING_CONFIRMATION. The payer cannot dispute while
+     *         still on PAID status — they must wait for the merchant to signal
+     *         completion first, or use reclaimFunds() once the dueDate has passed.
+     *
+     * @param invoiceId Invoice in AWAITING_CONFIRMATION state.
      * @param reason    Human-readable explanation of the dispute.
      */
     function raiseDispute(uint256 invoiceId, string calldata reason)
@@ -1143,8 +1270,11 @@ contract CryptoPaymentPlatform is Ownable, ReentrancyGuard, Pausable {
         Invoice storage inv = _invoices[invoiceId];
         if (msg.sender != inv.payer)                revert Unauthorized();
         if (inv.paymentType != PaymentType.PREPAID) revert Unauthorized();
-        if (inv.status != InvoiceStatus.PAID) {
+        if (inv.status != InvoiceStatus.AWAITING_CONFIRMATION) {
             revert InvalidInvoiceStatus(invoiceId, inv.status);
+        }
+        if (block.timestamp > _confirmationDeadline[invoiceId]) {
+            revert ConfirmationWindowExpired(invoiceId, _confirmationDeadline[invoiceId]);
         }
 
         EscrowRecord storage esc = _escrow[invoiceId];
@@ -1214,10 +1344,9 @@ contract CryptoPaymentPlatform is Ownable, ReentrancyGuard, Pausable {
         invoiceExists(invoiceId)
     {
         Invoice storage inv      = _invoices[invoiceId];
-        // Only PAID and DISPUTED invoices have populated escrow records.
-        // Calling on any other status means no escrow exists and the call
-        // would silently succeed with zero amounts while corrupting invoice state.
+        // Only statuses with a populated escrow record are accepted.
         if (inv.status != InvoiceStatus.PAID &&
+            inv.status != InvoiceStatus.AWAITING_CONFIRMATION &&
             inv.status != InvoiceStatus.DISPUTED &&
             inv.status != InvoiceStatus.CHALLENGE_PENDING) {
             revert InvalidInvoiceStatus(invoiceId, inv.status);
@@ -1250,8 +1379,9 @@ contract CryptoPaymentPlatform is Ownable, ReentrancyGuard, Pausable {
         invoiceExists(invoiceId)
     {
         Invoice storage inv      = _invoices[invoiceId];
-        // Accepts PAID, DISPUTED, and CHALLENGE_PENDING (escrow still populated).
+        // Accepts any status where escrow is still populated.
         if (inv.status != InvoiceStatus.PAID &&
+            inv.status != InvoiceStatus.AWAITING_CONFIRMATION &&
             inv.status != InvoiceStatus.DISPUTED &&
             inv.status != InvoiceStatus.CHALLENGE_PENDING) {
             revert InvalidInvoiceStatus(invoiceId, inv.status);
@@ -1916,6 +2046,17 @@ contract CryptoPaymentPlatform is Ownable, ReentrancyGuard, Pausable {
     }
 
     /**
+     * @notice Returns the timestamp by which the payer must confirm or dispute
+     *         after the merchant calls `markComplete()`. Returns 0 if the invoice
+     *         has not yet entered the AWAITING_CONFIRMATION state.
+     *
+     * @param invoiceId Invoice to query.
+     */
+    function getConfirmationDeadline(uint256 invoiceId) external view returns (uint256) {
+        return _confirmationDeadline[invoiceId];
+    }
+
+    /**
      * @notice Returns the effective fee configuration for a given merchant.
      *
      * @param merchant       Merchant to query.
@@ -2177,6 +2318,17 @@ contract CryptoPaymentPlatform is Ownable, ReentrancyGuard, Pausable {
      */
     function setMaxChallenges(uint256 max) external onlyAdmin {
         maxChallengesPerInvoice = max;
+    }
+
+    /**
+     * @notice Admin sets the confirmation window duration — how long the payer
+     *         has to call confirmCompletion() or raiseDispute() after the merchant
+     *         calls markComplete(). Default: 7 days. Minimum: 1 day.
+     * @param duration New window length in seconds.
+     */
+    function setConfirmationWindow(uint256 duration) external onlyAdmin {
+        if (duration < 1 days) revert InvalidAmount();
+        confirmationWindow = duration;
     }
 
     // =========================================================================
