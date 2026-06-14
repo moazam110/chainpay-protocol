@@ -1,0 +1,120 @@
+{
+  "project": "CryptoPaymentPlatform",
+  "version": "1.8.2",
+  "generatedAt": "2026-06-14",
+
+  "network": {
+    "name": "Daily Crypto Testnet",
+    "chainId": 825,
+    "rpcUrl": "https://rpc.testnet.dailycrypto.net",
+    "nativeCurrency": "DC",
+    "explorerUrl": null,
+    "evmVersion": "paris"
+  },
+
+  "deployer": "0x5962e5e56EF6b19b2D7bf4DEc66Ee80088252b6B",
+
+  "contracts": {
+    "MockUSDT": {
+      "description": "Test ERC-20 token representing USDT (6 decimals). For testnet use only.",
+      "address": "0x25d10a10514298becbe491c1ae727faf2f852538",
+      "deployTxHash": "0x11a4817abb78970b92d3694c55a35f164b65b85b66637d8fcccd3fd460e52403",
+      "blockNumber": 250107,
+      "decimals": 6,
+      "symbol": "USDT",
+      "initialSupply": "1000000000000",
+      "initialSupplyFormatted": "1,000,000 USDT",
+      "abiPath": "out/DeployTestToken.s.sol/MockUSDT.json"
+    },
+    "MockUSDC": {
+      "description": "Test ERC-20 token representing USDC (6 decimals). For testnet use only.",
+      "address": "0xac894b21891ecd48b89ec85b74032b42421c67f8",
+      "deployTxHash": "0xe41e1153ea1042a0a812bdc8fb446eb74233cdb3d42f28376ce5facf8548497a",
+      "blockNumber": 250106,
+      "decimals": 6,
+      "symbol": "USDC",
+      "initialSupply": "1000000000000",
+      "initialSupplyFormatted": "1,000,000 USDC",
+      "abiPath": "out/DeployTestToken.s.sol/MockUSDC.json"
+    },
+    "CryptoPaymentPlatform": {
+      "description": "Main payment platform contract v1.8.2.",
+      "address": "0xC93ABa2273C47e0f8298FD49Cd193B8B045cD631",
+      "deployTxHash": "0xe3c13ba8d87c64094401d396f141bee9b00afb2aa693433411ecf31cfb7e79ad",
+      "blockNumber": 255081,
+      "constructorArgs": {
+        "defaultFeeBps": 250
+      },
+      "abiPath": "out/CryptoPaymentPlatform.sol/CryptoPaymentPlatform.json"
+    }
+  },
+
+  "supportedTokens": [
+    {
+      "symbol": "DC",
+      "name": "Daily Crypto (native)",
+      "address": "0x0000000000000000000000000000000000000000",
+      "decimals": 18,
+      "note": "Use address(0) in contract calls for native ETH/DC"
+    },
+    {
+      "symbol": "USDT",
+      "name": "Mock USDT",
+      "address": "0x25d10a10514298becbe491c1ae727faf2f852538",
+      "decimals": 6
+    },
+    {
+      "symbol": "USDC",
+      "name": "Mock USDC",
+      "address": "0xac894b21891ecd48b89ec85b74032b42421c67f8",
+      "decimals": 6
+    }
+  ],
+
+  "integrationNotes": {
+    "frontend": {
+      "abiDirectory": "out/",
+      "mainContractAbi": "out/CryptoPaymentPlatform.sol/CryptoPaymentPlatform.json",
+      "erc20Abi": "out/DeployTestToken.s.sol/MockUSDT.json",
+      "approveBeforePay": "Before calling payPrepaidInvoice or payPostpaidInvoice, the payer must call ERC20.approve(platformAddress, amount) for the payment token.",
+      "nativeETH": "For DC (native currency) payments, send msg.value with the call — no approve needed. Use address 0x0000000000000000000000000000000000000000 as the token field.",
+      "invoiceStatuses": ["PENDING", "ACTIVE", "PAID", "AWAITING_CONFIRMATION", "COMPLETED", "CANCELLED", "DISPUTED", "CHALLENGE_PENDING"],
+      "keyViewFunctions": [
+        "getInvoice(uint256 invoiceId)",
+        "getEscrow(uint256 invoiceId)",
+        "getConfirmationDeadline(uint256 invoiceId)",
+        "getChallengeDeadline(uint256 invoiceId)",
+        "getMerchantInvoices(address merchant)",
+        "getPayerInvoices(address payer)",
+        "balanceOf(address user, address token)",
+        "isSubscriptionValid(address merchant)"
+      ]
+    },
+    "backend": {
+      "eventsToIndex": [
+        "InvoiceCreated(uint256 indexed invoiceId, address indexed merchant, address indexed payer)",
+        "InvoicePaid(uint256 indexed invoiceId, address indexed payer, uint256 amount)",
+        "WorkSubmitted(uint256 indexed invoiceId, address indexed merchant)",
+        "InvoiceConfirmed(uint256 indexed invoiceId, address indexed payer)",
+        "InvoiceMarkedComplete(uint256 indexed invoiceId, address indexed merchant)",
+        "FundsReclaimed(uint256 indexed invoiceId, address indexed payer)",
+        "DisputeRaised(uint256 indexed invoiceId, address indexed payer, string reason)",
+        "InvoiceCancelled(uint256 indexed invoiceId, string reason)",
+        "InvoiceAcknowledged(uint256 indexed invoiceId, address indexed payer)",
+        "P2PTransfer(address indexed from, address indexed to, address indexed token, uint256 amount, uint256 fee)"
+      ],
+      "confirmationWindowDefault": "7 days (604800 seconds)",
+      "challengeWindowDefault": "3 days (259200 seconds)",
+      "feeDenominator": 10000,
+      "defaultFeeBps": 250,
+      "nativeTokenSentinel": "0x0000000000000000000000000000000000000000"
+    }
+  },
+
+  "deployCommands": {
+    "dryRunTokens": "forge script script/DeployTestToken.s.sol:DeployTestToken --rpc-url https://rpc.testnet.dailycrypto.net --chain-id 825 --legacy --with-gas-price 1100000000 --private-key 0xYOUR_KEY",
+    "broadcastTokens": "forge script script/DeployTestToken.s.sol:DeployTestToken --rpc-url https://rpc.testnet.dailycrypto.net --chain-id 825 --legacy --with-gas-price 1100000000 --private-key 0xYOUR_KEY --broadcast",
+    "dryRunPlatform": "forge script script/DeployPlatform.s.sol:DeployPlatform --rpc-url https://rpc.testnet.dailycrypto.net --chain-id 825 --legacy --with-gas-price 1100000000 --private-key 0xYOUR_KEY",
+    "broadcastPlatform": "forge script script/DeployPlatform.s.sol:DeployPlatform --rpc-url https://rpc.testnet.dailycrypto.net --chain-id 825 --legacy --with-gas-price 1100000000 --private-key 0xYOUR_KEY --broadcast"
+  }
+}

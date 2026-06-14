@@ -1,0 +1,23 @@
+# Foundry build output
+/out/
+/cache/
+/broadcast/*/
+
+# Dependencies
+/lib/
+
+# Environment — NEVER commit private keys
+.env
+.env.*
+*.pem
+*.key
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
